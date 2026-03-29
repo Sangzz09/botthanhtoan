@@ -1,0 +1,54 @@
+{
+    "valid_keys": {
+        "7219600109": {
+            "key": "bố",
+            "expires": null
+        }
+    },
+    "key_store": {
+        "VIP-TEST-2024": {
+            "duration_days": 1,
+            "used_by": null
+        },
+        "VIP-WEEK-001": {
+            "duration_days": 7,
+            "used_by": null
+        },
+        "VIP-MONTH-001": {
+            "duration_days": 30,
+            "used_by": null
+        },
+        "VIP-FOREVER-1": {
+            "duration_days": -1,
+            "used_by": null
+        },
+        "bố": {
+            "duration_days": -1,
+            "used_by": 7219600109
+        }
+    },
+    "all_users": [
+        7219600109
+    ],
+    "pending_payments": {
+        "SEW7037": {
+            "uid": 7219600109,
+            "days": -1,
+            "amount": 380000
+        },
+        "SEW7445": {
+            "uid": 7219600109,
+            "days": 1,
+            "amount": 30000
+        }
+    },
+    "payment_history": {
+        "7219600109": [
+            {
+                "date": "2026-03-29T13:51:20.970799",
+                "description": "Kích hoạt key <code>bố</code>",
+                "details": "Vĩnh viễn"
+            }
+        ]
+    }
+}
