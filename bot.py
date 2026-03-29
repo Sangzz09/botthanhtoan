@@ -497,12 +497,21 @@ async def cb_deposit(cb: CallbackQuery):
 async def cb_pay(cb: CallbackQuery):
     amount = int(cb.data.split("_")[1])
     uid = cb.from_user.id
-    memo = f"NAP {uid}"  # ✅ UID trực tiếp, không cần pending_payments
 
-    qr_url = f"https://img.vietqr.io/image/MB-{BANK_STK}-compact2.png?amount={amount}&addInfo={memo}"
+    # ✅ Thêm 4 ký tự random để tránh trùng nội dung CK
+    rand_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    memo = f"NAP {uid} {rand_suffix}"
+
+    expire_time = datetime.now() + timedelta(minutes=10)
+    expire_str = expire_time.strftime('%H:%M:%S')
+
+    qr_url = (
+        f"https://img.vietqr.io/image/MB-{BANK_STK}-compact2.png"
+        f"?amount={amount}&addInfo={memo}"
+    )
 
     await cb.message.delete()
-    await cb.message.answer_photo(
+    sent = await cb.message.answer_photo(
         photo=qr_url,
         caption=(
             f"💰 <b>HÓA ĐƠN THANH TOÁN TỰ ĐỘNG</b>\n\n"
@@ -510,14 +519,40 @@ async def cb_pay(cb: CallbackQuery):
             f"💳 Số tài khoản: <code>{BANK_STK}</code>\n"
             f"💵 Số tiền: <b>{amount:,}đ</b>\n"
             f"📝 Nội dung CK: <code>{memo}</code>\n\n"
-            f"<i>⚠️ Vui lòng chuyển ĐÚNG SỐ TIỀN VÀ NỘI DUNG bên trên.\n"
-            f"Hệ thống sẽ tự động cộng số dư ngay lập tức!</i>"
+            f"⏳ <b>Mã QR hết hạn lúc: {expire_str} (10 phút)</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📖 <b>HƯỚNG DẪN NẠP TIỀN</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"1️⃣ Mở app ngân hàng → <b>Chuyển khoản QR</b>\n"
+            f"2️⃣ Quét mã QR ở trên\n"
+            f"3️⃣ Kiểm tra <b>số tiền</b> và <b>nội dung CK</b> đúng chưa\n"
+            f"4️⃣ Xác nhận chuyển khoản\n"
+            f"5️⃣ Chụp bill → <b>Gửi vào đây</b>\n\n"
+            f"<i>⚠️ Ghi ĐÚNG nội dung CK bên trên — hệ thống tự động cộng số dư!</i>"
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")
         ]])
     )
     await cb.answer()
+
+    # ✅ Tự xóa QR sau 10 phút
+    async def expire_qr():
+        await asyncio.sleep(600)
+        try:
+            await sent.delete()
+            await cb.message.answer(
+                "⏰ <b>Mã QR đã hết hạn!</b>\n\n"
+                "Vui lòng tạo mã mới để tiếp tục nạp tiền.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 Tạo QR mới", callback_data="deposit")],
+                    [InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]
+                ])
+            )
+        except Exception:
+            pass
+
+    asyncio.create_task(expire_qr())
 
 @dp.callback_query(F.data == "account")
 async def cb_account(cb: CallbackQuery):
