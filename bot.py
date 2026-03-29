@@ -1066,6 +1066,15 @@ async def sepay_webhook(request: Request):
         log.error(f"Webhook error: {e}")
         return {"status": "error"}
 
+@app.post("/api/sepay-webhook")
+async def sepay_webhook_api(request: Request):
+    """Alias route - cùng xử lý như /sepay-webhook"""
+    return await sepay_webhook(request)
+
+@app.get("/")
+async def health_check():
+    return {"status": "alive"}
+
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
