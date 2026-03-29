@@ -272,7 +272,7 @@ def fetch_prediction(game_id: str) -> dict:
 def kb_start(authorized: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🔑 Nhập Key", callback_data="enter_key")],
-        [InlineKeyboardButton(text=" Nạp Tiền", callback_data="deposit")],
+        [InlineKeyboardButton(text="💰 Nạp Tiền", callback_data="deposit")],
         [InlineKeyboardButton(text="ℹ️ Trợ Giúp (Help)", callback_data="help")],
     ]
     if authorized:
@@ -450,7 +450,7 @@ def welcome_text(user) -> str:
 # ─────────────────────────────────────────────
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp  = Dispatcher(storage=MemoryStorage())
-app = FastAPI()
+app = FastAPI(redirect_slashes=False)
 
 # ─────────────────────────────────────────────
 #  HANDLERS
@@ -617,7 +617,7 @@ async def cb_buy_vip_menu(cb: CallbackQuery):
     await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("buy_vip_"))
+@dp.callback_query(F.data.startswith("buy_vip_") & ~F.data.contains("menu"))
 async def cb_process_buy_vip(cb: CallbackQuery):
     days = int(cb.data.split("_")[2])
     price_map = {1: 30000, 7: 120000, 30: 220000, 999: 380000}
