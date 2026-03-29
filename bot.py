@@ -146,6 +146,14 @@ GAME_MAP = {g["id"]: g for g in GAMES}
 class UserState(StatesGroup):
     waiting_key = State()
 
+class AdminState(StatesGroup):
+    addkey_key = State()
+    addkey_days = State()
+    genkeys_amount = State()
+    genkeys_days = State()
+    delkey_key = State()
+    broadcast_text = State()
+
 # ─────────────────────────────────────────────
 #  HELPER: Kiểm tra key còn hiệu lực
 # ─────────────────────────────────────────────
@@ -264,7 +272,7 @@ def fetch_prediction(game_id: str) -> dict:
 def kb_start(authorized: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🔑 Nhập Key", callback_data="enter_key")],
-        [InlineKeyboardButton(text="🛒 Mua VIP", callback_data="buy_vip_menu")],
+        [InlineKeyboardButton(text=" Nạp Tiền", callback_data="deposit")],
         [InlineKeyboardButton(text="ℹ️ Trợ Giúp (Help)", callback_data="help")],
     ]
     if authorized:
@@ -299,6 +307,29 @@ def kb_game_result(game_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔄 Cập nhật dự đoán", callback_data=f"game_{game_id}")],
         [InlineKeyboardButton(text="◀️ Quay lại danh sách", callback_data="game_list")],
         [InlineKeyboardButton(text="🏠 Menu Chính", callback_data="home")],
+    ])
+
+def kb_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Thống Kê", callback_data="admin_stats"),
+         InlineKeyboardButton(text="📋 Danh Sách Key", callback_data="admin_listkeys")],
+        [InlineKeyboardButton(text="➕ Tạo 1 Key", callback_data="admin_addkey"),
+         InlineKeyboardButton(text="🎲 Tạo Nhiều Key", callback_data="admin_genkeys")],
+        [InlineKeyboardButton(text="❌ Xóa 1 Key", callback_data="admin_delkey"),
+         InlineKeyboardButton(text="🗑 Xóa Toàn Bộ", callback_data="admin_clear_keys")],
+        [InlineKeyboardButton(text="📢 Gửi Thông Báo", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="Đóng Menu", callback_data="admin_close")]
+    ])
+
+def kb_cancel_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Hủy", callback_data="admin_cancel")]
+    ])
+
+def kb_admin_confirm_clear() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ CÓ, XÓA TẤT CẢ!", callback_data="admin_confirm_clear_yes")],
+        [InlineKeyboardButton(text="Hủy", callback_data="admin_confirm_clear_no")]
     ])
 
 # ─────────────────────────────────────────────
@@ -762,145 +793,33 @@ async def cmd_menu(msg: Message):
         return
         
     text = (
-        "🛠 <b>DANH SÁCH LỆNH QUẢN TRỊ (ADMIN)</b> 🛠\n\n"
-        "🔑 <b>Quản lý Key:</b>\n"
-        "▪️ /addkey &lt;KEY&gt; &lt;SỐ_NGÀY&gt; - <i>Tạo 1 key thủ công</i>\n"
-        "▪️ /genkeys &lt;SỐ_LƯỢNG&gt; &lt;SỐ_NGÀY&gt; - <i>Tạo nhiều key ngẫu nhiên</i>\n"
-        "▪️ /delkey &lt;KEY&gt; - <i>Xóa 1 key và thu hồi quyền</i>\n"
-        "▪️ /xoatoanbokey - <i>Xóa toàn bộ key trên hệ thống</i>\n"
-        "▪️ /listkeys - <i>Xem danh sách tất cả các key</i>\n\n"
-        "📊 <b>Hệ thống:</b>\n"
-        "▪️ /stats - <i>Xem thống kê số lượng user, VIP</i>\n"
-        "▪️ /broadcast &lt;NỘI_DUNG&gt; - <i>Gửi tin nhắn tới toàn bộ user VIP</i>\n\n"
-        "<i>💡 Ghi chú: Sử dụng Số ngày = -1 để tạo key Vĩnh viễn.</i>"
+        "🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠\n\nChọn một chức năng bên dưới:"
     )
-    await msg.answer(text)
+    await msg.answer(text, reply_markup=kb_admin_menu())
 
+@dp.callback_query(F.data == "admin_close")
+async def cb_admin_close(cb: CallbackQuery):
+    await cb.message.delete()
 
-# ── ADMIN: Tạo key mới ──
-@dp.message(Command("addkey"))
-async def cmd_addkey(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+@dp.callback_query(F.data == "admin_cancel")
+async def cb_admin_cancel(cb: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
         return
-    # Usage: /addkey KEY_STRING DAYS  (DAYS=-1 for lifetime)
-    parts = msg.text.split()
-    if len(parts) != 3:
-        await msg.answer("❗ Dùng: /addkey &lt;KEY&gt; &lt;NGÀY&gt;  (NGÀY=-1 = vĩnh viễn)")
-        return
-    _, key, days_str = parts
-    try:
-        days = int(days_str)
-    except ValueError:
-        await msg.answer("❗ Số ngày phải là số nguyên.")
-        return
-    if key in key_store:
-        await msg.answer(f"⚠️ Key <code>{key}</code> đã tồn tại!")
-        return
-    key_store[key] = {"duration_days": days, "used_by": None}
-    save_data()
-    await msg.answer(f"✅ Đã tạo Key: <code>{key}</code> — {days if days != -1 else '♾️ Vĩnh viễn'} ngày")
 
+    await state.clear()
+    await cb.message.edit_text(
+        "🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠\n\nĐã hủy thao tác.",
+        reply_markup=kb_admin_menu()
+    )
+    await cb.answer("Đã hủy.")
 
-# ── ADMIN: Tạo nhiều key ngẫu nhiên ──
-@dp.message(Command("genkeys"))
-async def cmd_genkeys(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-        
-    # Usage: /genkeys AMOUNT DAYS
-    parts = msg.text.split()
-    if len(parts) != 3:
-        await msg.answer("❗ Dùng: /genkeys &lt;SỐ_LƯỢNG&gt; &lt;SỐ_NGÀY&gt; (VD: /genkeys 10 30)")
-        return
-        
-    try:
-        amount = int(parts[1])
-        days = int(parts[2])
-    except ValueError:
-        await msg.answer("❗ Số lượng và số ngày phải là số nguyên.")
-        return
-        
-    if amount <= 0 or amount > 50:
-        await msg.answer("❗ Vui lòng tạo từ 1 đến 50 key mỗi lần để tránh quá tải tin nhắn.")
-        return
-        
-    generated_keys = []
-    for _ in range(amount):
-        while True:
-            # Tạo chuỗi ngẫu nhiên 8 ký tự (chữ in hoa + số)
-            rand_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-            new_key = f"VIP-{rand_str[:4]}-{rand_str[4:]}"
-            if new_key not in key_store:
-                break
-        key_store[new_key] = {"duration_days": days, "used_by": None}
-        generated_keys.append(new_key)
-        
-    save_data()
-    keys_text = "\n".join([f"<code>{k}</code>" for k in generated_keys])
-    duration_text = f"{days} ngày" if days != -1 else "Vĩnh viễn ♾️"
-    await msg.answer(f"✅ <b>Đã tạo thành công {amount} key ({duration_text}):</b>\n\n{keys_text}\n\n<i>(Chạm vào key để copy)</i>")
+# --- Các chức năng Admin ---
 
-
-# ── ADMIN: Xóa key ──
-@dp.message(Command("delkey"))
-async def cmd_delkey(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
     
-    parts = msg.text.split()
-    if len(parts) != 2:
-        await msg.answer("❗ Dùng: /delkey &lt;KEY&gt;")
-        return
-        
-    key = parts[1]
-    if key not in key_store:
-        await msg.answer(f"⚠️ Key <code>{key}</code> không tồn tại!")
-        return
-        
-    # Thu hồi quyền của user nếu key này đã được kích hoạt
-    used_by = key_store[key].get("used_by")
-    if used_by is not None and used_by in valid_keys:
-        del valid_keys[used_by]
-        
-    del key_store[key]
-    save_data()
-    await msg.answer(f"✅ Đã xóa Key: <code>{key}</code> thành công và thu hồi quyền (nếu có)!")
-
-
-# ── ADMIN: Xóa toàn bộ key ──
-@dp.message(Command("xoatoanbokey"))
-async def cmd_xoatoanbokey(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-        
-    key_store.clear()
-    valid_keys.clear()
-    save_data()
-    await msg.answer("✅ <b>Đã xóa toàn bộ Key trong hệ thống!</b>\n<i>(Bao gồm tất cả các key chưa sử dụng và các key đang được kích hoạt).</i>")
-
-
-# ── ADMIN: Xem danh sách key ──
-@dp.message(Command("listkeys"))
-async def cmd_listkeys(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    if not key_store:
-        await msg.answer("Chưa có key nào.")
-        return
-    lines = ["📋 <b>Danh sách Key</b>\n"]
-    for k, v in key_store.items():
-        used = f"User {v['used_by']}" if v["used_by"] else "Chưa dùng"
-        d    = "♾️" if v["duration_days"] == -1 else f"{v['duration_days']}d"
-        lines.append(f"• <code>{k}</code> [{d}] — {used}")
-    await msg.answer("\n".join(lines))
-
-
-# ── ADMIN: Thống kê ──
-@dp.message(Command("stats"))
-async def cmd_stats(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-        
     total_users = len(all_users)
     active_vip = sum(1 for uid in valid_keys if is_authorized(uid))
     
@@ -910,26 +829,191 @@ async def cmd_stats(msg: Message):
         f"👑 Người dùng VIP (Active): <b>{active_vip}</b>\n"
         f"🔑 Tổng số Key đã tạo: <b>{len(key_store)}</b>"
     )
-    await msg.answer(text)
+    await cb.message.edit_text(text, reply_markup=kb_admin_menu())
+    await cb.answer("Đã cập nhật thống kê!")
 
+@dp.callback_query(F.data == "admin_listkeys")
+async def cb_admin_listkeys(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    
+    if not key_store:
+        await cb.answer("Chưa có key nào.", show_alert=True)
+        return
 
-# ── ADMIN: Broadcast ──
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    lines = ["📋 <b>Danh sách Key</b>\n"]
+    for k, v in key_store.items():
+        used = f"User {v['used_by']}" if v["used_by"] else "Chưa dùng"
+        d    = "♾️" if v["duration_days"] == -1 else f"{v['duration_days']}d"
+        lines.append(f"• <code>{k}</code> [{d}] — {used}")
+    
+    text = "\n".join(lines)
+    
+    try:
+        await cb.message.edit_text(text, reply_markup=kb_admin_menu())
+        await cb.answer("Đã tải danh sách key!")
+    except Exception: # Message too long
+        await cb.message.answer(text)
+        await cb.answer("Danh sách key quá dài, đã gửi trong tin nhắn mới.")
+
+@dp.callback_query(F.data == "admin_clear_keys")
+async def cb_admin_clear_keys(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    await cb.message.edit_text(
+        "⚠️ <b>BẠN CÓ CHẮC CHẮN MUỐN XÓA TOÀN BỘ KEY KHÔNG?</b>\n\n"
+        "Hành động này sẽ xóa tất cả key đã tạo và thu hồi VIP của tất cả người dùng. Không thể hoàn tác!",
+        reply_markup=kb_admin_confirm_clear()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "admin_confirm_clear_yes")
+async def cb_admin_confirm_clear_yes(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    key_store.clear()
+    valid_keys.clear()
+    save_data()
+    await cb.message.edit_text(
+        "✅ <b>Đã xóa toàn bộ Key trong hệ thống!</b>",
+        reply_markup=kb_admin_menu()
+    )
+    await cb.answer("Đã dọn dẹp toàn bộ key!", show_alert=True)
+
+@dp.callback_query(F.data == "admin_confirm_clear_no")
+async def cb_admin_confirm_clear_no(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    await cb.message.edit_text(
+        "🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠\n\nĐã hủy thao tác xóa.",
+        reply_markup=kb_admin_menu()
+    )
+    await cb.answer("Đã hủy.")
+
+@dp.callback_query(F.data == "admin_addkey")
+async def cb_admin_addkey_start(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.addkey_key)
+    await cb.message.edit_text(
+        "<b>Bước 1/2:</b> Vui lòng nhập tên Key bạn muốn tạo:",
+        reply_markup=kb_cancel_admin()
+    )
+    await cb.answer()
+
+@dp.message(AdminState.addkey_key)
+async def process_admin_addkey_key(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID: return
+    key = msg.text.strip()
+    if key in key_store:
+        await msg.answer(f"⚠️ Key <code>{key}</code> đã tồn tại! Vui lòng nhập một key khác:", reply_markup=kb_cancel_admin())
         return
-    text = msg.text.replace("/broadcast", "").strip()
-    if not text:
-        await msg.answer("Dùng: /broadcast &lt;nội dung&gt;")
+    await state.update_data(key=key)
+    await state.set_state(AdminState.addkey_days)
+    await msg.answer("<b>Bước 2/2:</b> Vui lòng nhập số ngày sử dụng cho key (nhập -1 cho key vĩnh viễn):", reply_markup=kb_cancel_admin())
+
+@dp.message(AdminState.addkey_days)
+async def process_admin_addkey_days(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID: return
+    try:
+        days = int(msg.text.strip())
+    except ValueError:
+        await msg.answer("❗ Số ngày không hợp lệ. Vui lòng nhập một số nguyên (VD: 30 hoặc -1):", reply_markup=kb_cancel_admin())
         return
+    data = await state.get_data()
+    key = data['key']
+    key_store[key] = {"duration_days": days, "used_by": None}
+    save_data()
+    await state.clear()
+    await msg.answer(f"✅ Đã tạo Key thành công!\n\nKey: <code>{key}</code>\nThời hạn: {days if days != -1 else '♾️ Vĩnh viễn'} ngày")
+    await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
+
+@dp.callback_query(F.data == "admin_genkeys")
+async def cb_admin_genkeys_start(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.genkeys_amount)
+    await cb.message.edit_text("<b>Bước 1/2:</b> Vui lòng nhập số lượng key muốn tạo (tối đa 50):", reply_markup=kb_cancel_admin())
+    await cb.answer()
+
+@dp.message(AdminState.genkeys_amount)
+async def process_admin_genkeys_amount(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID: return
+    try:
+        amount = int(msg.text.strip())
+        if not (0 < amount <= 50): raise ValueError
+    except ValueError:
+        await msg.answer("❗ Số lượng không hợp lệ. Vui lòng nhập một số từ 1 đến 50:", reply_markup=kb_cancel_admin())
+        return
+    await state.update_data(amount=amount)
+    await state.set_state(AdminState.genkeys_days)
+    await msg.answer("<b>Bước 2/2:</b> Vui lòng nhập số ngày sử dụng cho các key (nhập -1 cho key vĩnh viễn):", reply_markup=kb_cancel_admin())
+
+@dp.message(AdminState.genkeys_days)
+async def process_admin_genkeys_days(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID: return
+    try:
+        days = int(msg.text.strip())
+    except ValueError:
+        await msg.answer("❗ Số ngày không hợp lệ. Vui lòng nhập một số nguyên (VD: 30 hoặc -1):", reply_markup=kb_cancel_admin())
+        return
+    data = await state.get_data()
+    amount = data['amount']
+    generated_keys = []
+    for _ in range(amount):
+        while True:
+            rand_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            new_key = f"VIP-{rand_str[:4]}-{rand_str[4:]}"
+            if new_key not in key_store: break
+        key_store[new_key] = {"duration_days": days, "used_by": None}
+        generated_keys.append(new_key)
+    save_data()
+    await state.clear()
+    keys_text = "\n".join([f"<code>{k}</code>" for k in generated_keys])
+    duration_text = f"{days} ngày" if days != -1 else "Vĩnh viễn ♾️"
+    await msg.answer(f"✅ <b>Đã tạo thành công {amount} key ({duration_text}):</b>\n\n{keys_text}\n\n<i>(Chạm vào key để copy)</i>")
+    await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
+
+@dp.callback_query(F.data == "admin_delkey")
+async def cb_admin_delkey_start(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.delkey_key)
+    await cb.message.edit_text("Vui lòng nhập tên Key bạn muốn xóa:", reply_markup=kb_cancel_admin())
+    await cb.answer()
+
+@dp.message(AdminState.delkey_key)
+async def process_admin_delkey_key(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID: return
+    key = msg.text.strip()
+    if key not in key_store:
+        await msg.answer(f"⚠️ Key <code>{key}</code> không tồn tại! Vui lòng nhập lại:", reply_markup=kb_cancel_admin())
+        return
+    used_by = key_store[key].get("used_by")
+    if used_by is not None and used_by in valid_keys:
+        del valid_keys[used_by]
+    del key_store[key]
+    save_data()
+    await state.clear()
+    await msg.answer(f"✅ Đã xóa Key: <code>{key}</code> thành công và thu hồi quyền (nếu có)!")
+    await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast_start(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.broadcast_text)
+    await cb.message.edit_text("Vui lòng nhập nội dung tin nhắn bạn muốn gửi tới tất cả người dùng VIP:", reply_markup=kb_cancel_admin())
+    await cb.answer()
+
+@dp.message(AdminState.broadcast_text)
+async def process_admin_broadcast_text(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID: return
+    text = msg.text.strip()
+    await state.clear()
     sent = 0
     for uid in valid_keys:
+        if not is_authorized(uid): continue
         try:
-            await bot.send_message(uid, f"📢 <b>THÔNG BÁO</b>\n\n{text}")
+            await bot.send_message(uid, f"📢 <b>THÔNG BÁO TỪ ADMIN</b>\n\n{text}")
             sent += 1
+            await asyncio.sleep(0.1)
         except Exception:
             pass
-    await msg.answer(f"✅ Đã gửi tới {sent} người dùng.")
+    await msg.answer(f"✅ Đã gửi thông báo tới {sent} người dùng VIP đang hoạt động.")
+    await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
 
 
 # ─────────────────────────────────────────────
