@@ -11,7 +11,7 @@ import random
 import re
 import string
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
@@ -179,6 +179,12 @@ def clean_memo(name: str) -> str:
     clean = ''.join(e for e in n if e.isalnum()).upper()
     return clean if clean else "USER"
 
+VN_TZ = timezone(timedelta(hours=7))
+
+def now_vn() -> datetime:
+    """Trả về datetime hiện tại theo giờ Việt Nam (UTC+7)."""
+    return datetime.now(VN_TZ)
+
 # ─────────────────────────────────────────────
 #  HELPER: Gọi API dự đoán
 # ─────────────────────────────────────────────
@@ -332,7 +338,7 @@ def format_taixiu(game: dict, data: dict) -> str:
         f"🔄 Loại cầu: <i>{data['bridge_type']}</i>\n"
         f"📉 Pattern: <code>{data['pattern']}</code>\n"
         f"{'─'*28}\n"
-        f"⏱ Cập nhật: {datetime.now().strftime('%H:%M:%S')}"
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
     )
 
 def format_sicbo(game: dict, data: dict) -> str:
@@ -353,7 +359,7 @@ def format_sicbo(game: dict, data: dict) -> str:
         f"📊 Độ tin cậy: <b>{conf}%</b>\n"
         f"   <code>[{conf_bar}]</code>\n"
         f"{'─'*28}\n"
-        f"⏱ Cập nhật: {datetime.now().strftime('%H:%M:%S')}"
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
     )
 
 def format_baccarat(game: dict, data: dict) -> str:
@@ -372,7 +378,7 @@ def format_baccarat(game: dict, data: dict) -> str:
         f"🔄 Loại cầu: <i>{data['bridge_type']}</i>\n"
         f"📉 Pattern: <code>{data['pattern']}</code>\n"
         f"{'─'*28}\n"
-        f"⏱ Cập nhật: {datetime.now().strftime('%H:%M:%S')}"
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
     )
 
 def format_result(game: dict, data: dict) -> str:
@@ -502,7 +508,7 @@ async def cb_pay(cb: CallbackQuery):
     rand_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     memo = f"NAP {uid} {rand_suffix}"
 
-    expire_time = datetime.now() + timedelta(minutes=10)
+    expire_time = now_vn() + timedelta(minutes=10)
     expire_str = expire_time.strftime('%H:%M:%S')
 
     qr_url = (
@@ -1015,7 +1021,7 @@ async def sepay_webhook(request: Request):
         if uid not in payment_history:
             payment_history[uid] = []
         payment_history[uid].insert(0, {
-            "date": datetime.now().isoformat(),
+            "date": now_vn().isoformat(),
             "description": "Nạp tiền tự động (SePay)",
             "details": f"+{amount_in:,.0f}đ"
         })
@@ -1036,15 +1042,33 @@ async def sepay_webhook(request: Request):
         except Exception as e:
             log.warning(f"⚠️ Không gửi được tin nhắn cho user {uid}: {e}")
 
+        # Lấy thông tin Telegram của user
+        tele_name = "Không rõ"
+        tele_username = ""
+        try:
+            chat = await bot.get_chat(uid)
+            tele_name = chat.full_name or "Không rõ"
+            tele_username = f"@{chat.username}" if chat.username else "Không có username"
+        except Exception:
+            pass
+
+        now_str = now_vn().strftime('%d/%m/%Y %H:%M:%S')
+
         # Gửi thông báo cho Admin
         try:
             await bot.send_message(
                 ADMIN_ID,
-                f"💰 <b>KHÁCH NẠP TIỀN (WEBHOOK)</b>\n\n"
-                f"👤 UID: <code>{uid}</code>\n"
-                f"💵 Số tiền: +{amount_in:,.0f}đ\n"
-                f"📝 Nội dung CK: {content}\n"
-                f"💳 Số dư mới của khách: {bal:,.0f}đ"
+                f"🔔 <b>ĐƠN NẠP TIỀN MỚI</b>\n"
+                f"{'━'*28}\n"
+                f"👤 <b>Tên Telegram:</b> {tele_name}\n"
+                f"🔗 <b>Username:</b> {tele_username}\n"
+                f"🆔 <b>ID Telegram:</b> <code>{uid}</code>\n"
+                f"{'━'*28}\n"
+                f"⏰ <b>Thời gian:</b> {now_str}\n"
+                f"📝 <b>Nội dung CK:</b> <code>{content}</code>\n"
+                f"💵 <b>Số tiền:</b> <b>+{amount_in:,.0f}đ</b>\n"
+                f"{'━'*28}\n"
+                f"💳 <b>Số dư mới của khách:</b> {bal:,.0f}đ"
             )
         except Exception as e:
             log.warning(f"⚠️ Không gửi được tin nhắn cho admin: {e}")
