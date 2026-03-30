@@ -1,5 +1,5 @@
 """
-Bot Telegram Dự Đoán Tài Xỉu / Sicbo / Baccarat
+TOOL AI SEW PRO — Bot Telegram Dự Đoán Tài Xỉu / Sicbo / Baccarat
 Sử dụng: Python + aiogram 3.x
 """
 
@@ -51,6 +51,23 @@ all_users: set[int] = set()
 payment_history: dict[int, list] = {}
 user_balances: dict[int, int] = {}
 
+# ─────────────────────────────────────────────
+#  AUTO-PREDICT: subscriptions & session cache
+# ─────────────────────────────────────────────
+auto_subs: dict[int, set] = {}          # uid → set of "game_id" hoặc "bcr_table_N"
+last_session_cache: dict[str, str] = {} # game_key → last seen session
+
+# ─────────────────────────────────────────────
+#  AUTO-DELETE: theo dõi tin nhắn để tự xóa
+# ─────────────────────────────────────────────
+# msg_tracker: uid → list of {"chat_id": int, "msg_id": int, "sent_at": datetime}
+msg_tracker: dict[int, list] = {}
+# pending_qr: uid → {"chat_id": int, "msg_id": int, "task": asyncio.Task | None}
+pending_qr: dict[int, dict] = {}
+
+MSG_TTL_HOURS = 3          # Xóa tin nhắn cũ hơn N giờ
+QR_EXPIRE_MINUTES = 10     # QR hết hạn sau N phút
+
 key_store: dict[str, dict] = {
     "VIP-TEST-2024": {"duration_days": 1,   "used_by": None},
     "VIP-WEEK-001" : {"duration_days": 7,   "used_by": None},
@@ -66,12 +83,14 @@ def save_data():
             "key": info["key"],
             "expires": exp.isoformat() if isinstance(exp, datetime) else None
         }
+    subs_json = {str(k): list(v) for k, v in auto_subs.items()}
     data = {
         "valid_keys": vk_json,
         "key_store": key_store,
         "all_users": list(all_users),
         "payment_history": payment_history,
-        "user_balances": user_balances
+        "user_balances": user_balances,
+        "auto_subs": subs_json,
     }
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -105,6 +124,9 @@ def load_data():
         if "user_balances" in data:
             user_balances.clear()
             user_balances.update({int(k): int(v) for k, v in data["user_balances"].items()})
+        if "auto_subs" in data:
+            auto_subs.clear()
+            auto_subs.update({int(k): set(v) for k, v in data["auto_subs"].items()})
     except Exception as e:
         log.error(f"Lỗi đọc file: {e}")
 
@@ -128,6 +150,7 @@ GAMES = [
     {"id": "68gb_md5",     "name": "🔒 68gb Bàn MD5",        "type": "taixiu"},
     {"id": "luck8",        "name": "🍀 Luck8",                "type": "taixiu"},
     {"id": "b52_tx",       "name": "✈️ TX B52",               "type": "taixiu"},
+    {"id": "bcr_sunwin",   "name": "🏆 Baccarat Sunwin",       "type": "baccarat_sunwin"},
 ]
 
 GAME_MAP = {g["id"]: g for g in GAMES}
@@ -186,6 +209,82 @@ def now_vn() -> datetime:
     return datetime.now(VN_TZ)
 
 # ─────────────────────────────────────────────
+#  HELPER: Track & Auto-delete tin nhắn
+# ─────────────────────────────────────────────
+def track_message(uid: int, chat_id: int, msg_id: int):
+    """Lưu tin nhắn vào tracker để auto-xóa sau MSG_TTL_HOURS giờ."""
+    if uid not in msg_tracker:
+        msg_tracker[uid] = []
+    msg_tracker[uid].append({
+        "chat_id": chat_id,
+        "msg_id" : msg_id,
+        "sent_at": now_vn(),
+    })
+    # Giới hạn tối đa 200 tin nhắn/user để tránh tràn bộ nhớ
+    if len(msg_tracker[uid]) > 200:
+        msg_tracker[uid] = msg_tracker[uid][-200:]
+
+async def auto_delete_old_messages():
+    """Background task: mỗi 5 phút scan và xóa tin nhắn cũ > MSG_TTL_HOURS giờ."""
+    log.info("🗑 Bắt đầu auto-delete background task...")
+    while True:
+        await asyncio.sleep(300)  # 5 phút
+        cutoff = now_vn() - timedelta(hours=MSG_TTL_HOURS)
+        deleted = 0
+        for uid in list(msg_tracker.keys()):
+            remaining = []
+            for entry in msg_tracker[uid]:
+                if entry["sent_at"] < cutoff:
+                    try:
+                        await bot.delete_message(entry["chat_id"], entry["msg_id"])
+                        deleted += 1
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        pass  # Tin nhắn đã xóa rồi hoặc không có quyền — bỏ qua
+                else:
+                    remaining.append(entry)
+            if remaining:
+                msg_tracker[uid] = remaining
+            else:
+                msg_tracker.pop(uid, None)
+        if deleted:
+            log.info(f"🗑 Auto-delete: đã xóa {deleted} tin nhắn cũ > {MSG_TTL_HOURS}h")
+
+async def delete_qr_for_user(uid: int, reason: str = "expired"):
+    """Xóa QR đang pending của user và gửi thông báo tương ứng."""
+    entry = pending_qr.pop(uid, None)
+    if not entry:
+        return
+    # Huỷ expire task nếu còn đang chạy
+    task = entry.get("task")
+    if task and not task.done():
+        task.cancel()
+    # Xóa tin nhắn QR
+    try:
+        await bot.delete_message(entry["chat_id"], entry["msg_id"])
+    except Exception:
+        pass
+    # Gửi thông báo phù hợp
+    if reason == "paid":
+        # Khi CK thành công: chỉ xóa QR, thông báo đầy đủ do webhook gửi riêng
+        pass
+    else:  # expired
+        try:
+            sent_msg = await bot.send_message(
+                uid,
+                "⏰ <b>Mã QR đã hết hạn!</b>\n\n"
+                "🗑 Mã QR đã được tự động xóa.\n"
+                "Vui lòng tạo mã mới để tiếp tục nạp tiền.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 Tạo QR mới",    callback_data="deposit")],
+                    [InlineKeyboardButton(text="🏠 Về Menu Chính",  callback_data="home")],
+                ])
+            )
+            track_message(uid, sent_msg.chat.id, sent_msg.message_id)
+        except Exception:
+            pass
+
+# ─────────────────────────────────────────────
 #  HELPER: Gọi API dự đoán
 # ─────────────────────────────────────────────
 def fetch_prediction(game_id: str) -> dict:
@@ -232,6 +331,140 @@ def fetch_prediction(game_id: str) -> dict:
         except Exception as e:
             log.warning(f"API error for {game_id}: {e}")
 
+    elif game_id == "lc79_hu":
+        try:
+            resp = requests.get("http://160.250.137.196:5000/lc79-hu", timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                conf_str = str(data.get("ti_le", "70%"))
+                conf = int(float(conf_str.replace("%", "").strip())) if conf_str.replace("%","").strip().replace(".","").isdigit() else 70
+                pred = str(data.get("du_doan", "")).strip().upper()
+                pred = "TÀI" if pred in ["TAI","TÀI","T"] else ("XỈU" if pred in ["XIU","XỈU","X"] else pred)
+                return {
+                    "game_id"        : game_id,
+                    "current_session": str(data.get("phien_hien_tai", "N/A")),
+                    "dice"           : [0, 0, 0],
+                    "total"          : 0,
+                    "result"         : "N/A",
+                    "next_session"   : str(int(str(data.get("phien_hien_tai","0")).replace("#","") or 0) + 1),
+                    "prediction"     : pred,
+                    "confidence"     : conf,
+                    "bridge_type"    : "Cầu lc79 Hũ",
+                    "pattern"        : "N/A",
+                }
+        except Exception as e:
+            log.warning(f"API error for {game_id}: {e}")
+
+    elif game_id == "lc79_md5":
+        try:
+            resp = requests.get("http://160.250.137.196:5000/lc79-md5", timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                conf_str = str(data.get("ti_le", "70%"))
+                conf = int(float(conf_str.replace("%", "").strip())) if conf_str.replace("%","").strip().replace(".","").isdigit() else 70
+                pred = str(data.get("du_doan", "")).strip().upper()
+                pred = "TÀI" if pred in ["TAI","TÀI","T"] else ("XỈU" if pred in ["XIU","XỈU","X"] else pred)
+                return {
+                    "game_id"        : game_id,
+                    "current_session": str(data.get("phien_hien_tai", "N/A")),
+                    "dice"           : [0, 0, 0],
+                    "total"          : 0,
+                    "result"         : "N/A",
+                    "next_session"   : str(int(str(data.get("phien_hien_tai","0")).replace("#","") or 0) + 1),
+                    "prediction"     : pred,
+                    "confidence"     : conf,
+                    "bridge_type"    : "Cầu lc79 MD5",
+                    "pattern"        : "N/A",
+                }
+        except Exception as e:
+            log.warning(f"API error for {game_id}: {e}")
+
+    elif game_id == "luck8":
+        try:
+            resp = requests.get("https://luck8md5vip-4vph.onrender.com/api/taixiu", timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                conf_str = str(data.get("doTinCay", "70%"))
+                try:
+                    conf = int(float(conf_str.replace("%", "").strip()))
+                except Exception:
+                    conf = 70
+                pred_raw = str(data.get("duDoan", "")).strip()
+                pred_up  = pred_raw.upper()
+                pred = "TÀI" if pred_up in ["TAI","TÀI","T"] else ("XỈU" if pred_up in ["XIU","XỈU","X"] else pred_raw)
+                ket_raw = str(data.get("ketQua", "")).strip().upper()
+                result  = "TÀI" if "TÀI" in ket_raw or "TAI" in ket_raw else ("XỈU" if "XỈU" in ket_raw or "XIU" in ket_raw else ket_raw if ket_raw else "N/A")
+                xuc     = data.get("xucXac", [0, 0, 0])
+                if isinstance(xuc, list) and len(xuc) >= 3:
+                    xuc = [int(xuc[0]), int(xuc[1]), int(xuc[2])]
+                else:
+                    xuc = [0, 0, 0]
+                pattern_raw  = str(data.get("pattern", ""))
+                pattern_disp = pattern_raw[-20:] if len(pattern_raw) > 20 else (pattern_raw if pattern_raw else "N/A")
+                return {
+                    "game_id"        : game_id,
+                    "current_session": str(data.get("phien", "N/A")),
+                    "dice"           : xuc,
+                    "total"          : sum(xuc),
+                    "result"         : result,
+                    "next_session"   : str(data.get("phienHienTai", "N/A")),
+                    "prediction"     : pred,
+                    "confidence"     : conf,
+                    "bridge_type"    : "Cầu Luck8",
+                    "pattern"        : pattern_disp,
+                }
+        except Exception as e:
+            log.warning(f"API error for {game_id}: {e}")
+
+    elif game_id == "b52_tx":
+        try:
+            resp = requests.get("https://b52-taixiu-l69b.onrender.com/api/taixiu", timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                conf_str = str(data.get("Do_tin_cay", "70%"))
+                try:
+                    conf = int(float(conf_str.replace("%","").strip()))
+                except Exception:
+                    conf = 70
+                pred = str(data.get("Du_doan", "")).strip().upper()
+                pred = "TÀI" if pred in ["TAI","TÀI","T","TÀI"] else ("XỈU" if pred in ["XIU","XỈU","X"] else pred)
+                result = str(data.get("Ket_qua","")).strip().upper()
+                result = "TÀI" if "TÀI" in result or "TAI" in result else ("XỈU" if "XỈU" in result or "XIU" in result else result)
+                pattern_raw = str(data.get("Pattern",""))
+                pattern_disp = pattern_raw[-20:] if len(pattern_raw) > 20 else pattern_raw
+                return {
+                    "game_id"        : game_id,
+                    "current_session": str(data.get("Phien", "N/A")),
+                    "dice"           : [data.get("Xuc_xac_1",0), data.get("Xuc_xac_2",0), data.get("Xuc_xac_3",0)],
+                    "total"          : data.get("Tong", 0),
+                    "result"         : result,
+                    "next_session"   : str(data.get("phien_hien_tai", "N/A")),
+                    "prediction"     : pred,
+                    "confidence"     : conf,
+                    "bridge_type"    : "Cầu B52",
+                    "pattern"        : pattern_disp if pattern_disp else "N/A",
+                }
+        except Exception as e:
+            log.warning(f"API error for {game_id}: {e}")
+
+    elif game_id in ("68gb_xanh", "68gb_md5"):
+        # Key map: 68gb_xanh -> bàn xanh, 68gb_md5 -> bàn đỏ/md5
+        # API mới trả về "key":"banxanh" và "key":"md5" trong mảng data[]
+        key_map = {
+            "68gb_xanh": ["banxanh","ban_xanh","ban-xanh","xanh","68gb_xanh","BanXanh","ban xanh"],
+            "68gb_md5" : ["md5","ban_do","ban-do","do","68gb_do","BanDo","ban do","ban_md5"],
+        }
+        bridge_map = {"68gb_xanh": "Cầu 68gb Bàn Xanh", "68gb_md5": "Cầu 68gb Bàn Đỏ"}
+        try:
+            raw = fetch_68gb_all()
+            if raw.get("ok"):
+                for key_try in key_map[game_id]:
+                    parsed = _parse_68gb_item(raw["data"], key_try, game_id, bridge_map[game_id])
+                    if parsed.get("ok"):
+                        return parsed
+        except Exception as e:
+            log.warning(f"API error for {game_id}: {e}")
+
     dice = [random.randint(1, 6) for _ in range(3)]
     total = sum(dice)
     result = "TÀI" if total >= 11 else "XỈU"
@@ -252,6 +485,258 @@ def fetch_prediction(game_id: str) -> dict:
         "position"       : random.choice(["Cửa Tài", "Cửa Xỉu", "Cửa Chẵn", "Cửa Lẻ"]),
         "baccarat_result": random.choice(["Player", "Banker", "Tie"]),
     }
+
+def fetch_68gb_all() -> dict:
+    """Gọi API 68gb tổng hợp — trả về bàn xanh, bàn đỏ, bàn md5."""
+    try:
+        resp = requests.get("https://six8gbsew.onrender.com/all", timeout=10)
+        if resp.status_code == 200:
+            return {"ok": True, "data": resp.json()}
+    except Exception as e:
+        log.warning(f"68gb all API error: {e}")
+    return {"ok": False}
+
+def _parse_68gb_item(data: dict, key: str, game_id: str, bridge_name: str) -> dict:
+    """Parse item từ response 68gb /all theo key bàn.
+
+    Hỗ trợ cả 2 format:
+      - Mới: {"status":..., "data":[{"key":"banxanh", ...}, ...]}
+      - Cũ : {"ban_xanh": {...}, ...}
+    """
+    key_norm = key.lower().replace("-","").replace("_","").replace(" ","")
+    item = {}
+
+    # ── Format mới: data["data"] là list, mỗi phần tử có field "key" ──
+    if isinstance(data, dict):
+        arr = data.get("data", [])
+        if isinstance(arr, list):
+            for entry in arr:
+                if not isinstance(entry, dict):
+                    continue
+                entry_key = str(entry.get("key","")).lower().replace("-","").replace("_","").replace(" ","")
+                if entry_key == key_norm or key_norm in entry_key or entry_key in key_norm:
+                    item = entry
+                    break
+
+    # ── Fallback format cũ: dict có key trực tiếp ──
+    if not item and isinstance(data, dict):
+        item = data.get(key, {})
+    if not item and isinstance(data, dict):
+        for k, v in data.items():
+            if key_norm in k.lower().replace("-","").replace("_","").replace(" ",""):
+                item = v
+                break
+
+    if not item:
+        return {"ok": False}
+
+    # ── Độ tin cậy ──
+    raw_conf = item.get("do_tin_cay", item.get("ti_le", item.get("Do_tin_cay", None)))
+    if raw_conf is None:
+        conf = 70
+    else:
+        try:
+            conf = int(float(str(raw_conf).replace("%","").strip()))
+        except Exception:
+            conf = 70
+
+    # ── Dự đoán ──
+    pred_raw = str(item.get("du_doan", item.get("Du_doan",""))).strip()
+    pred_up  = pred_raw.upper()
+    if pred_up in ["TAI","TÀI","T","TÀI","TAIXIU_TAI"]:
+        pred = "TÀI"
+    elif pred_up in ["XIU","XỈU","X","TAIXIU_XIU"]:
+        pred = "XỈU"
+    else:
+        pred = pred_raw if pred_raw else "N/A"
+
+    # ── Kết quả ──
+    ket_qua_raw = str(item.get("ket_qua", item.get("Ket_qua",""))).strip()
+    kq_up = ket_qua_raw.upper()
+    if "TÀI" in kq_up or "TAI" in kq_up:
+        result = "TÀI"
+    elif "XỈU" in kq_up or "XIU" in kq_up:
+        result = "XỈU"
+    else:
+        result = ket_qua_raw if ket_qua_raw and ket_qua_raw.lower() != "none" else "N/A"
+
+    # ── Phiên ──
+    phien = str(item.get("phien", item.get("Phien", item.get("phien_hien_tai","N/A")))).replace("#","")
+    next_phien = str(item.get("phien_hien_tai", item.get("phien_tiep_theo",
+        str(int(phien) + 1) if phien.isdigit() else "N/A")))
+
+    # ── Xúc xắc — hỗ trợ cả dạng list mới [d1,d2,d3] và dạng cũ xuc_xac_1/2/3 ──
+    xuc_list = item.get("xuc_xac", [])
+    if isinstance(xuc_list, list) and len(xuc_list) >= 3:
+        xuc = [int(xuc_list[0]), int(xuc_list[1]), int(xuc_list[2])]
+    else:
+        xuc = [item.get("xuc_xac_1", item.get("Xuc_xac_1", 0)),
+               item.get("xuc_xac_2", item.get("Xuc_xac_2", 0)),
+               item.get("xuc_xac_3", item.get("Xuc_xac_3", 0))]
+    tong = item.get("tong", item.get("Tong", sum(xuc)))
+
+    # ── Vị trí (vi) — hỗ trợ list mới [v1,v2,...] ──
+    vi_raw = item.get("vi", item.get("dudoan_vi", ""))
+    if isinstance(vi_raw, list):
+        position = ",".join(str(v) for v in vi_raw)
+    else:
+        position = str(vi_raw)
+
+    pattern_raw = str(item.get("Pattern", item.get("pattern","")))
+    pattern_disp = pattern_raw[-20:] if len(pattern_raw) > 20 else (pattern_raw if pattern_raw else "N/A")
+
+    return {
+        "ok"             : True,
+        "game_id"        : game_id,
+        "current_session": phien,
+        "dice"           : xuc,
+        "total"          : tong,
+        "result"         : result,
+        "next_session"   : next_phien.replace("#",""),
+        "prediction"     : pred,
+        "confidence"     : conf,
+        "bridge_type"    : bridge_name,
+        "pattern"        : pattern_disp,
+        "position"       : position,
+    }
+
+def fetch_bcr_sunwin() -> dict:
+    """Gọi API BCR Sunwin từ endpoint /all của six8gbsew."""
+    try:
+        resp = requests.get("https://six8gbsew.onrender.com/all", timeout=10)
+        if resp.status_code == 200:
+            raw = resp.json()
+            bcr_item = None
+
+            # ── Format mới: raw["data"] là list, tìm item có key "baccarat" ──
+            if isinstance(raw, dict):
+                arr = raw.get("data", [])
+                if isinstance(arr, list):
+                    for entry in arr:
+                        if not isinstance(entry, dict):
+                            continue
+                        k = str(entry.get("key","")).lower()
+                        if k in ("baccarat","bcr","bcr_sunwin","baccarat_sunwin"):
+                            bcr_item = entry
+                            break
+
+            # ── Fallback format cũ: dict key trực tiếp ──
+            if not bcr_item and isinstance(raw, dict):
+                for k in ["bcr","baccarat","bcr_sunwin","BCR","Baccarat"]:
+                    if k in raw:
+                        bcr_item = raw[k]
+                        break
+
+            if not bcr_item:
+                return {"ok": False}
+
+            # Parse từ item tìm được
+            raw_conf = bcr_item.get("do_tin_cay", bcr_item.get("Độ tin cậy", None))
+            try:
+                conf = int(float(str(raw_conf).replace("%","").strip())) if raw_conf is not None else 75
+            except Exception:
+                conf = 75
+
+            du_doan = bcr_item.get("du_doan", bcr_item.get("Dự đoán", "N/A"))
+            phien   = bcr_item.get("phien", bcr_item.get("Số phiên", 0))
+            return {
+                "ok"        : True,
+                "ban"       : str(bcr_item.get("ban", bcr_item.get("Bàn", "1"))),
+                "so_phien"  : phien,
+                "du_doan"   : du_doan,
+                "loai_cau"  : bcr_item.get("loai_cau", bcr_item.get("Loại cầu", [])),
+                "confidence": conf,
+                "do_manh"   : bcr_item.get("do_manh", bcr_item.get("Độ mạnh", "N/A")),
+                "trang_thai": bcr_item.get("trang_thai", bcr_item.get("Trạng thái", "N/A")),
+                "dev"       : bcr_item.get("dev", bcr_item.get("Dev", "")),
+            }
+    except Exception as e:
+        log.warning(f"BCR Sunwin API error: {e}")
+    return {"ok": False}
+
+def _parse_bcr_item(data: dict, table_num: int = 0) -> dict:
+    """Parse một object bàn từ API BCR."""
+    ds = data.get("Danh sách", [])
+    item = ds[0] if ds else {}
+    conf_str = item.get("Độ tin cậy", "75%")
+    try:
+        conf = int(float(conf_str.replace("%", "").strip()))
+    except Exception:
+        conf = 75
+    return {
+        "ok"        : True,
+        "ban"       : data.get("Bàn", str(table_num)),
+        "so_phien"  : data.get("Số phiên", 0),
+        "du_doan"   : item.get("Dự đoán", "N/A"),
+        "loai_cau"  : item.get("Loại cầu", []),
+        "confidence": conf,
+        "do_manh"   : item.get("Độ mạnh", "N/A"),
+        "trang_thai": item.get("Trạng thái", "N/A"),
+        "dev"       : item.get("Dev", ""),
+    }
+
+def fetch_bcr_sexy(table_num: int) -> dict:
+    """Gọi API Baccarat Sexy theo số bàn cụ thể /apibcr/{n}."""
+    try:
+        resp = requests.get(
+            f"https://bcrsexysewpro.onrender.com/apibcr/{table_num}",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return _parse_bcr_item(resp.json(), table_num)
+    except Exception as e:
+        log.warning(f"BCR Sexy API error table {table_num}: {e}")
+    return {"ok": False}
+
+def fetch_bcr_all() -> list:
+    """Gọi API tổng hợp /apibcr — trả về danh sách tất cả bàn."""
+    try:
+        resp = requests.get(
+            "https://bcrsexysewpro.onrender.com/apibcr",
+            timeout=15
+        )
+        if resp.status_code == 200:
+            raw = resp.json()
+            # API trả về list các bàn
+            if isinstance(raw, list):
+                return [_parse_bcr_item(item, i + 1) for i, item in enumerate(raw)]
+            # API trả về dict có key "Danh sách" chứa list bàn
+            if isinstance(raw, dict):
+                tables = raw.get("Danh sách", raw.get("data", [raw]))
+                if isinstance(tables, list):
+                    return [_parse_bcr_item(t, i + 1) for i, t in enumerate(tables)]
+    except Exception as e:
+        log.warning(f"BCR all tables API error: {e}")
+    return []
+
+def fetch_hit_sicbo() -> dict:
+    """Gọi API Sicbo Hitclub."""
+    try:
+        resp = requests.get("https://sichit.onrender.com/sicbo", timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            conf_str = data.get("do_tin_cay", "75%")
+            try:
+                conf = int(float(conf_str.replace("%", "").strip()))
+            except Exception:
+                conf = 75
+            return {
+                "ok"          : True,
+                "game_id"     : "hit_sicbo",
+                "current_session": str(data.get("phien", "")).replace("#", ""),
+                "dice"        : [data.get("xuc_xac_1", 0), data.get("xuc_xac_2", 0), data.get("xuc_xac_3", 0)],
+                "total"       : data.get("tong", 0),
+                "result"      : str(data.get("ket_qua", "")),
+                "next_session": str(data.get("phien_hien_tai", "")).replace("#", ""),
+                "prediction"  : str(data.get("du_doan", "")),
+                "position"    : str(data.get("dudoan_vi", "")),
+                "confidence"  : conf,
+                "bridge_type" : str(data.get("ly_do", "Cầu Hệ Thống")),
+                "pattern"     : "N/A",
+            }
+    except Exception as e:
+        log.warning(f"Hit Sicbo API error: {e}")
+    return {"ok": False}
 
 # ─────────────────────────────────────────────
 #  KEYBOARD BUILDERS
@@ -286,11 +771,17 @@ def kb_games() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_game_result(game_id: str) -> InlineKeyboardMarkup:
+def kb_game_result(game_id: str, uid: int = 0) -> InlineKeyboardMarkup:
+    subscribed = game_id in auto_subs.get(uid, set())
+    sub_btn = (
+        InlineKeyboardButton(text="🔕 Dừng tự động", callback_data=f"unsub_{game_id}")
+        if subscribed else
+        InlineKeyboardButton(text="🔔 Nhận tự động", callback_data=f"sub_{game_id}")
+    )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Cập nhật dự đoán", callback_data=f"game_{game_id}")],
-        [InlineKeyboardButton(text="◀️ Quay lại danh sách", callback_data="game_list")],
-        [InlineKeyboardButton(text="🏠 Menu Chính", callback_data="home")],
+        [sub_btn],
+        [InlineKeyboardButton(text="◀️ Quay lại", callback_data="game_list"),
+         InlineKeyboardButton(text="🏠 Menu Chính", callback_data="home")],
     ])
 
 def kb_admin_menu() -> InlineKeyboardMarkup:
@@ -316,30 +807,82 @@ def kb_admin_confirm_clear() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Hủy", callback_data="admin_confirm_clear_no")]
     ])
 
+def kb_bcr_tables(current: int = 0) -> InlineKeyboardMarkup:
+    """Keyboard chọn bàn Baccarat Sexy (10 bàn, 5 cột x 2 hàng)."""
+    rows = []
+    row = []
+    for i in range(1, 11):
+        label = f"{'✅ ' if i == current else ''}Bàn {i}"
+        row.append(InlineKeyboardButton(text=label, callback_data=f"bcr_table_{i}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="📋 Tất cả bàn", callback_data="bcr_all"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="◀️ Quay lại", callback_data="game_list"),
+        InlineKeyboardButton(text="🏠 Menu Chính", callback_data="home"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_bcr_table_result(table_num: int, uid: int = 0) -> InlineKeyboardMarkup:
+    """Keyboard kết quả 1 bàn BCR — có nút subscribe."""
+    key = f"bcr_table_{table_num}"
+    subscribed = key in auto_subs.get(uid, set())
+    sub_btn = (
+        InlineKeyboardButton(text="🔕 Dừng tự động", callback_data=f"unsub_{key}")
+        if subscribed else
+        InlineKeyboardButton(text="🔔 Nhận tự động", callback_data=f"sub_{key}")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [sub_btn],
+        [InlineKeyboardButton(text="🎰 Chọn bàn khác", callback_data="game_baccarat_sexy"),
+         InlineKeyboardButton(text="🏠 Menu Chính", callback_data="home")],
+    ])
+
+def kb_bcr_all() -> InlineKeyboardMarkup:
+    """Keyboard cho màn hình tổng hợp tất cả bàn."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Chọn bàn cụ thể", callback_data="game_baccarat_sexy")],
+        [InlineKeyboardButton(text="◀️ Quay lại", callback_data="game_list"),
+         InlineKeyboardButton(text="🏠 Menu Chính", callback_data="home")],
+    ])
+
 # ─────────────────────────────────────────────
 #  FORMAT TEXT KẾT QUẢ
 # ─────────────────────────────────────────────
 def format_taixiu(game: dict, data: dict) -> str:
     dice = data["dice"]
-    pred_emoji = "📈 TÀI" if data["prediction"] == "TÀI" else "📉 XỈU"
+    pred = data["prediction"]
+    pred_emoji = "📈 TÀI" if pred == "TÀI" else ("📉 XỈU" if pred == "XỈU" else f"🎯 {pred}")
     conf = data["confidence"]
     conf_bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
-    return (
-        f"🎲 <b>GAME: {game['name']}</b>\n"
-        f"{'─'*28}\n"
-        f"🔹 Phiên hiện tại: <code>{data['current_session']}</code>\n"
-        f"🔹 Kết quả: <b>{data['result']}</b> — Tổng: <b>{data['total']}</b>\n"
-        f"🎲 Xúc xắc: <b>{dice[0]}</b> ─ <b>{dice[1]}</b> ─ <b>{dice[2]}</b>\n"
-        f"{'─'*28}\n"
-        f"🔮 Phiên dự đoán: <code>{data['next_session']}</code>\n"
-        f"🎯 Dự đoán: <b>{pred_emoji}</b>\n"
-        f"📊 Độ tin cậy: <b>{conf}%</b>\n"
-        f"   <code>[{conf_bar}]</code>\n"
-        f"🔄 Loại cầu: <i>{data['bridge_type']}</i>\n"
-        f"📉 Pattern: <code>{data['pattern']}</code>\n"
-        f"{'─'*28}\n"
-        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
-    )
+    has_dice = any(d > 0 for d in dice)
+    has_result = data["result"] not in ("N/A", "", "0")
+    lines = [
+        f"🎲 <b>GAME: {game['name']}</b>",
+        f"{'─'*28}",
+        f"🔹 Phiên hiện tại: <code>{data['current_session']}</code>",
+    ]
+    if has_result:
+        lines.append(f"🔹 Kết quả: <b>{data['result']}</b> — Tổng: <b>{data['total']}</b>")
+    if has_dice:
+        lines.append(f"🎲 Xúc xắc: <b>{dice[0]}</b> ─ <b>{dice[1]}</b> ─ <b>{dice[2]}</b>")
+    lines += [
+        f"{'─'*28}",
+        f"🔮 Phiên dự đoán: <code>{data['next_session']}</code>",
+        f"🎯 Dự đoán: <b>{pred_emoji}</b>",
+        f"📊 Độ tin cậy: <b>{conf}%</b>",
+        f"   <code>[{conf_bar}]</code>",
+        f"🔄 Loại cầu: <i>{data['bridge_type']}</i>",
+        f"📉 Pattern: <code>{data['pattern']}</code>",
+        f"{'─'*28}",
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)",
+    ]
+    return "\n".join(lines)
 
 def format_sicbo(game: dict, data: dict) -> str:
     dice = data["dice"]
@@ -381,12 +924,74 @@ def format_baccarat(game: dict, data: dict) -> str:
         f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
     )
 
+def pred_icon(du_doan: str) -> str:
+    du = du_doan.lower()
+    if any(x in du for x in ["banker", "cái", "cai"]):
+        return "🔵"
+    if any(x in du for x in ["player", "nhà", "nha"]):
+        return "🔴"
+    if "tie" in du or "hòa" in du or "hoa" in du:
+        return "🟡"
+    return "🎯"
+
+def format_bcr_all(tables: list) -> str:
+    """Hiển thị tổng hợp tất cả bàn BCR Sexy dạng compact."""
+    if not tables:
+        return "⚠️ Không lấy được dữ liệu từ API. Vui lòng thử lại!"
+    lines = [
+        "👠 <b>BACCARAT SEXY — TẤT CẢ BÀN</b>",
+        f"{'─'*30}",
+    ]
+    for d in tables:
+        if not d.get("ok"):
+            continue
+        ban = d.get("ban", "?")
+        phien = d.get("so_phien", "?")
+        du_doan = d.get("du_doan", "N/A")
+        conf = d.get("confidence", 0)
+        do_manh = d.get("do_manh", "")
+        trang_thai = d.get("trang_thai", "")
+        icon = pred_icon(du_doan)
+        lines.append(
+            f"{icon} <b>Bàn {ban}</b> — Phiên <code>{phien}</code>\n"
+            f"   🎯 <b>{du_doan}</b> | {conf}% | {do_manh}\n"
+            f"   {trang_thai}"
+        )
+        lines.append("─" * 30)
+    lines.append(f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)")
+    return "\n".join(lines)
+
+def format_bcr_sexy(table_num: int, d: dict) -> str:
+    conf = d.get("confidence", 75)
+    conf_bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
+    cau_list = d.get("loai_cau", [])
+    cau_text = "\n".join([f"   • {c}" for c in cau_list]) if cau_list else "   • N/A"
+    du_doan = d.get("du_doan", "N/A")
+    icon = pred_icon(du_doan)
+    return (
+        f"👠 <b>BACCARAT SEXY — BÀN {table_num}</b>\n"
+        f"{'─'*28}\n"
+        f"🔹 Số phiên: <code>{d.get('so_phien', 'N/A')}</code>\n"
+        f"{'─'*28}\n"
+        f"🎯 Dự đoán: {icon} <b>{du_doan}</b>\n"
+        f"📊 Độ tin cậy: <b>{conf}%</b>\n"
+        f"   <code>[{conf_bar}]</code>\n"
+        f"💪 Độ mạnh: <b>{d.get('do_manh', 'N/A')}</b>\n"
+        f"🏆 Trạng thái: <b>{d.get('trang_thai', 'N/A')}</b>\n"
+        f"{'─'*28}\n"
+        f"🔄 Loại cầu phát hiện:\n{cau_text}\n"
+        f"{'─'*28}\n"
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
+    )
+
 def format_result(game: dict, data: dict) -> str:
     t = game["type"]
     if t == "sicbo":
         return format_sicbo(game, data)
     if t == "baccarat":
         return format_baccarat(game, data)
+    if t == "baccarat_sunwin":
+        return format_bcr_sexy(1, data)   # dùng lại format BCR
     return format_taixiu(game, data)
 
 # ─────────────────────────────────────────────
@@ -401,7 +1006,7 @@ def welcome_text(user) -> str:
     balance = user_balances.get(user_id, 0)
     return (
         "╔══════════════════════════╗\n"
-        "║   🏆  <b>VIP PREDICT BOT</b>  🏆   ║\n"
+        "║  🤖  <b>TOOL AI SEW PRO</b>  🤖  ║\n"
         "╚══════════════════════════╝\n\n"
         "👤 <b>THÔNG TIN CÁ NHÂN</b>\n"
         f"┣ Tên: <b>{name}</b>{username}\n"
@@ -504,12 +1109,16 @@ async def cb_pay(cb: CallbackQuery):
     amount = int(cb.data.split("_")[1])
     uid = cb.from_user.id
 
+    # Nếu user đang có QR cũ chưa dùng → xóa đi trước
+    if uid in pending_qr:
+        await delete_qr_for_user(uid, reason="expired")
+
     # ✅ Thêm 4 ký tự random để tránh trùng nội dung CK
     rand_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     memo = f"NAP {uid} {rand_suffix}"
 
-    expire_time = now_vn() + timedelta(minutes=10)
-    expire_str = expire_time.strftime('%H:%M:%S')
+    expire_time = now_vn() + timedelta(minutes=QR_EXPIRE_MINUTES)
+    expire_str  = expire_time.strftime('%H:%M:%S')
 
     qr_url = (
         f"https://img.vietqr.io/image/MB-{BANK_STK}-compact2.png"
@@ -525,7 +1134,7 @@ async def cb_pay(cb: CallbackQuery):
             f"💳 Số tài khoản: <code>{BANK_STK}</code>\n"
             f"💵 Số tiền: <b>{amount:,}đ</b>\n"
             f"📝 Nội dung CK: <code>{memo}</code>\n\n"
-            f"⏳ <b>Mã QR hết hạn lúc: {expire_str} (10 phút)</b>\n\n"
+            f"⏳ <b>Mã QR hết hạn lúc: {expire_str} ({QR_EXPIRE_MINUTES} phút)</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📖 <b>HƯỚNG DẪN NẠP TIỀN</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -533,7 +1142,7 @@ async def cb_pay(cb: CallbackQuery):
             f"2️⃣ Quét mã QR ở trên\n"
             f"3️⃣ Kiểm tra <b>số tiền</b> và <b>nội dung CK</b> đúng chưa\n"
             f"4️⃣ Xác nhận chuyển khoản\n"
-            f"5️⃣ Chụp bill → <b>Gửi vào đây</b>\n\n"
+            f"5️⃣ Hệ thống sẽ <b>tự động cộng số dư</b> và xóa mã QR\n\n"
             f"<i>⚠️ Ghi ĐÚNG nội dung CK bên trên — hệ thống tự động cộng số dư!</i>"
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -542,23 +1151,19 @@ async def cb_pay(cb: CallbackQuery):
     )
     await cb.answer()
 
-    # ✅ Tự xóa QR sau 10 phút
+    # Lưu QR vào pending_qr và lên lịch expire
     async def expire_qr():
-        await asyncio.sleep(600)
-        try:
-            await sent.delete()
-            await cb.message.answer(
-                "⏰ <b>Mã QR đã hết hạn!</b>\n\n"
-                "Vui lòng tạo mã mới để tiếp tục nạp tiền.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="💰 Tạo QR mới", callback_data="deposit")],
-                    [InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]
-                ])
-            )
-        except Exception:
-            pass
+        await asyncio.sleep(QR_EXPIRE_MINUTES * 60)
+        await delete_qr_for_user(uid, reason="expired")
 
-    asyncio.create_task(expire_qr())
+    task = asyncio.create_task(expire_qr())
+    pending_qr[uid] = {
+        "chat_id": sent.chat.id,
+        "msg_id" : sent.message_id,
+        "task"   : task,
+    }
+    # Track tin nhắn QR vào auto-delete 3h
+    track_message(uid, sent.chat.id, sent.message_id)
 
 @dp.callback_query(F.data == "account")
 async def cb_account(cb: CallbackQuery):
@@ -719,7 +1324,7 @@ async def process_key(msg: Message, state: FSMContext):
         f"✅ <b>Kích hoạt Key thành công!</b>\n\n"
         f"🔑 Key: <code>{key}</code>\n"
         f"⏳ Hạn sử dụng: <b>{exp_str}</b>\n\n"
-        f"Chào mừng bạn đến với VIP Predict Bot! 🎉",
+        f"Chào mừng bạn đến với TOOL AI SEW PRO! 🎉",
         reply_markup=kb_start(True)
     )
     try:
@@ -760,10 +1365,86 @@ async def cb_game(cb: CallbackQuery):
     if not game:
         await cb.answer("Game không tồn tại.", show_alert=True)
         return
-    await cb.answer("⏳ Đang tải dự đoán...")
+
+    # ── Baccarat Sunwin: gọi API riêng ──
+    if game_id == "bcr_sunwin":
+        await cb.answer("⏳ Đang tải Baccarat Sunwin...")
+        raw = await asyncio.to_thread(fetch_bcr_sunwin)
+        if raw.get("ok"):
+            text = format_bcr_sexy(1, raw)
+            text = text.replace("BÀN 1", "SUNWIN")
+        else:
+            text = "🏆 <b>BACCARAT SUNWIN</b>\n\n⚠️ Không lấy được dữ liệu từ API. Thử lại sau!"
+        await cb.message.edit_text(text, reply_markup=kb_game_result(game_id))
+        return
+
+    # ── Baccarat Sexy: hiện menu chọn bàn ──
+    if game_id == "baccarat_sexy":
+        await cb.message.edit_text(
+            "👠 <b>BACCARAT SEXY</b>\n\n"
+            "🎰 Chọn bàn bạn muốn xem dự đoán:\n"
+            "<i>(Mỗi bàn là 1 bàn chơi riêng biệt trên hệ thống)</i>",
+            reply_markup=kb_bcr_tables()
+        )
+        await cb.answer()
+        return
+
+    # ── Sicbo Hitclub: dùng API riêng ──
+    if game_id == "hit_sicbo":
+        await cb.answer()
+        raw = await asyncio.to_thread(fetch_hit_sicbo)
+        if raw.get("ok"):
+            text = format_sicbo(game, raw)
+        else:
+            text = f"🎯 <b>{game['name']}</b>\n\n⚠️ Không lấy được dữ liệu. Thử lại sau!"
+        await cb.message.edit_text(text, reply_markup=kb_game_result(game_id, uid))
+        return
+
+    await cb.answer()
     data = await asyncio.to_thread(fetch_prediction, game_id)
     text = format_result(game, data)
-    await cb.message.edit_text(text, reply_markup=kb_game_result(game_id))
+    await cb.message.edit_text(text, reply_markup=kb_game_result(game_id, uid))
+
+@dp.callback_query(F.data.startswith("bcr_table_"))
+async def cb_bcr_table(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not is_authorized(uid):
+        await cb.answer("❌ Key hết hạn hoặc chưa kích hoạt!", show_alert=True)
+        return
+    try:
+        table_num = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Bàn không hợp lệ.", show_alert=True)
+        return
+    await cb.answer(f"⏳ Đang tải Bàn {table_num}...")
+    raw = await asyncio.to_thread(fetch_bcr_sexy, table_num)
+    if raw.get("ok"):
+        text = format_bcr_sexy(table_num, raw)
+    else:
+        text = (
+            f"👠 <b>BACCARAT SEXY — BÀN {table_num}</b>\n\n"
+            f"⚠️ Không lấy được dữ liệu từ API.\n"
+            f"Vui lòng thử lại sau!"
+        )
+    await cb.message.edit_text(text, reply_markup=kb_bcr_table_result(table_num, uid))
+
+@dp.callback_query(F.data == "bcr_all")
+async def cb_bcr_all(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not is_authorized(uid):
+        await cb.answer("❌ Key hết hạn hoặc chưa kích hoạt!", show_alert=True)
+        return
+    await cb.answer("⏳ Đang tải tất cả bàn...")
+    tables = await asyncio.to_thread(fetch_bcr_all)
+    if tables:
+        text = format_bcr_all(tables)
+    else:
+        text = (
+            "👠 <b>BACCARAT SEXY — TẤT CẢ BÀN</b>\n\n"
+            "⚠️ Không lấy được dữ liệu từ API.\n"
+            "Thử xem từng bàn riêng lẻ hoặc thử lại sau!"
+        )
+    await cb.message.edit_text(text, reply_markup=kb_bcr_all())
 
 # ── ADMIN MENU ──
 @dp.message(Command("menu"))
@@ -1029,16 +1710,24 @@ async def sepay_webhook(request: Request):
 
         bal = user_balances[uid]
 
-        # Gửi thông báo cho User
+        # ✅ Xóa QR đang pending của user (nếu có)
+        await delete_qr_for_user(uid, reason="paid")
+
+        # Gửi thông báo NẠP THÀNH CÔNG kèm số dư
         try:
-            await bot.send_message(
+            nap_msg = await bot.send_message(
                 uid,
                 f"✅ <b>NẠP TIỀN THÀNH CÔNG!</b>\n\n"
                 f"💰 Đã nhận: <b>+{amount_in:,.0f}đ</b>\n"
                 f"💳 Số dư hiện tại: <b>{bal:,.0f}đ</b>\n\n"
-                f"<i>👉 Vào Menu Chính → <b>MUA VIP</b> để đổi số dư thành ngày sử dụng!</i>"
+                f"<i>👉 Vào Menu Chính → <b>MUA VIP</b> để đổi số dư thành ngày sử dụng!</i>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🛒 Mua VIP ngay", callback_data="buy_vip_menu"),
+                    InlineKeyboardButton(text="🏠 Menu Chính",   callback_data="home"),
+                ]])
             )
-            log.info(f"✅ Đã gửi thông báo cho user {uid}")
+            track_message(uid, nap_msg.chat.id, nap_msg.message_id)
+            log.info(f"✅ Đã gửi thông báo nạp tiền cho user {uid}")
         except Exception as e:
             log.warning(f"⚠️ Không gửi được tin nhắn cho user {uid}: {e}")
 
@@ -1079,6 +1768,181 @@ async def sepay_webhook(request: Request):
         log.error(f"❌ Webhook error: {e}")
         return {"status": "error", "detail": str(e)}
 
+# ─────────────────────────────────────────────
+#  AUTO-PREDICT: Subscribe / Unsubscribe
+# ─────────────────────────────────────────────
+POLL_GAMES = ["sunwin_tx", "sunwin_sicbo", "lc79_hu", "lc79_md5", "b52_tx", "hit_sicbo"]
+BCR_POLL_TABLES = list(range(1, 11))
+POLL_INTERVAL = 12  # giây
+
+GAME_LABELS = {
+    "sunwin_tx"    : "🎯 Tài Xỉu Sunwin",
+    "sunwin_sicbo" : "🎱 Sicbo Sunwin",
+    "lc79_hu"      : "🏺 lc79 Hũ",
+    "lc79_md5"     : "🔑 lc79 MD5",
+    "b52_tx"       : "✈️ TX B52",
+    "hit_sicbo"    : "🎯 Sicbo Hitclub",
+}
+
+def sub_label(key: str) -> str:
+    if key.startswith("bcr_table_"):
+        n = key.split("_")[2]
+        return f"👠 Baccarat Sexy Bàn {n}"
+    return GAME_LABELS.get(key, key)
+
+@dp.callback_query(F.data.startswith("sub_"))
+async def cb_subscribe(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not is_authorized(uid):
+        await cb.answer("❌ Key hết hạn!", show_alert=True)
+        return
+    key = cb.data[4:]
+    if uid not in auto_subs:
+        auto_subs[uid] = set()
+    auto_subs[uid].add(key)
+    save_data()
+    label = sub_label(key)
+    await cb.answer(f"✅ Đã bật tự động: {label}", show_alert=False)
+    # Cập nhật inline keyboard
+    try:
+        if key.startswith("bcr_table_"):
+            table_num = int(key.split("_")[2])
+            await cb.message.edit_reply_markup(reply_markup=kb_bcr_table_result(table_num, uid))
+        else:
+            await cb.message.edit_reply_markup(reply_markup=kb_game_result(key, uid))
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("unsub_"))
+async def cb_unsubscribe(cb: CallbackQuery):
+    uid = cb.from_user.id
+    key = cb.data[6:]
+    if uid in auto_subs:
+        auto_subs[uid].discard(key)
+        if not auto_subs[uid]:
+            del auto_subs[uid]
+    save_data()
+    label = sub_label(key)
+    await cb.answer(f"🔕 Đã tắt tự động: {label}", show_alert=False)
+    try:
+        if key.startswith("bcr_table_"):
+            table_num = int(key.split("_")[2])
+            await cb.message.edit_reply_markup(reply_markup=kb_bcr_table_result(table_num, uid))
+        else:
+            await cb.message.edit_reply_markup(reply_markup=kb_game_result(key, uid))
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────
+#  AUTO-PREDICT: Background polling tasks
+# ─────────────────────────────────────────────
+def get_session_key(game_id: str, data: dict) -> str:
+    """Lấy session key để so sánh phiên mới/cũ."""
+    return str(data.get("next_session") or data.get("current_session") or "")
+
+async def broadcast_game(game_id: str, data: dict):
+    """Gửi dự đoán mới tới tất cả subscriber của game này."""
+    game = GAME_MAP.get(game_id)
+    if not game:
+        return
+    if game_id == "hit_sicbo":
+        text = format_sicbo(game, data)
+    else:
+        text = format_result(game, data)
+    text += "\n\n🤖 <i>Dự đoán tự động</i>"
+
+    kb = kb_game_result(game_id)  # keyboard không có uid — dùng chung
+    dead_uids = []
+    for uid, keys in list(auto_subs.items()):
+        if game_id not in keys:
+            continue
+        if not is_authorized(uid):
+            continue
+        try:
+            kb_uid = kb_game_result(game_id, uid)
+            sent_msg = await bot.send_message(uid, text, reply_markup=kb_uid)
+            track_message(uid, sent_msg.chat.id, sent_msg.message_id)
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
+                dead_uids.append((uid, game_id))
+    for uid, gid in dead_uids:
+        if uid in auto_subs:
+            auto_subs[uid].discard(gid)
+
+async def broadcast_bcr_table(table_num: int, raw: dict):
+    """Gửi dự đoán BCR Sexy tới subscriber bàn đó."""
+    key = f"bcr_table_{table_num}"
+    text = format_bcr_sexy(table_num, raw)
+    text += "\n\n🤖 <i>Dự đoán tự động</i>"
+    dead_uids = []
+    for uid, keys in list(auto_subs.items()):
+        if key not in keys:
+            continue
+        if not is_authorized(uid):
+            continue
+        try:
+            sent_msg = await bot.send_message(uid, text, reply_markup=kb_bcr_table_result(table_num, uid))
+            track_message(uid, sent_msg.chat.id, sent_msg.message_id)
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
+                dead_uids.append((uid, key))
+    for uid, k in dead_uids:
+        if uid in auto_subs:
+            auto_subs[uid].discard(k)
+
+async def poll_game_loop(game_id: str):
+    """Background task: poll 1 game liên tục, broadcast khi phiên mới."""
+    log.info(f"🔄 Bắt đầu poll: {game_id}")
+    while True:
+        try:
+            if game_id == "hit_sicbo":
+                data = await asyncio.to_thread(fetch_hit_sicbo)
+                if not data.get("ok"):
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+            else:
+                data = await asyncio.to_thread(fetch_prediction, game_id)
+
+            sess = get_session_key(game_id, data)
+            if sess and sess != last_session_cache.get(game_id):
+                last_session_cache[game_id] = sess
+                # Chỉ broadcast nếu có subscriber
+                has_subs = any(game_id in v for v in auto_subs.values())
+                if has_subs:
+                    await broadcast_game(game_id, data)
+        except Exception as e:
+            log.warning(f"Poll error {game_id}: {e}")
+        await asyncio.sleep(POLL_INTERVAL)
+
+async def poll_bcr_table_loop(table_num: int):
+    """Background task: poll 1 bàn BCR liên tục."""
+    key = f"bcr_table_{table_num}"
+    while True:
+        try:
+            raw = await asyncio.to_thread(fetch_bcr_sexy, table_num)
+            if raw.get("ok"):
+                sess = str(raw.get("so_phien", ""))
+                if sess and sess != last_session_cache.get(key):
+                    last_session_cache[key] = sess
+                    has_subs = any(key in v for v in auto_subs.values())
+                    if has_subs:
+                        await broadcast_bcr_table(table_num, raw)
+        except Exception as e:
+            log.warning(f"Poll BCR table {table_num} error: {e}")
+        await asyncio.sleep(POLL_INTERVAL)
+
+async def start_all_poll_tasks():
+    """Khởi động tất cả background polling tasks."""
+    log.info("🚀 Khởi động auto-predict polling tasks...")
+    for gid in POLL_GAMES:
+        asyncio.create_task(poll_game_loop(gid))
+    for t in BCR_POLL_TABLES:
+        asyncio.create_task(poll_bcr_table_loop(t))
+    asyncio.create_task(auto_delete_old_messages())
+    log.info(f"✅ Đã khởi động {len(POLL_GAMES)} game + {len(BCR_POLL_TABLES)} bàn BCR + auto-delete task")
+
 # Route alias
 @app.post("/api/sepay-webhook")
 async def sepay_webhook_api(request: Request):
@@ -1098,7 +1962,8 @@ async def main():
     try:
         await asyncio.gather(
             server.serve(),
-            dp.start_polling(bot, handle_signals=False)
+            dp.start_polling(bot, handle_signals=False),
+            start_all_poll_tasks(),
         )
     except OSError as e:
         log.error(f"Lỗi Port: {e}")
