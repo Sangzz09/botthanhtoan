@@ -11,11 +11,10 @@ import random
 import re
 import string
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
@@ -37,7 +36,6 @@ import requests
 BOT_TOKEN  = "8293331183:AAFbaUlOIms2ioHPgUpEF78q8zkPWTXnBvA"
 ADMIN_ID   = 7219600109
 ADMIN_LINK = "https://t.me/sewdangcap"
-SEPAY_API_TOKEN = "" # 🔴 ĐIỀN API TOKEN TỪ SEPAY.VN VÀO ĐÂY
 BANK_STK   = "0886027767"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -48,26 +46,16 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 DATA_FILE = "bot_data.json"
 
-# Cấu trúc: { user_id: {"key": "...", "expires": datetime | None} }
 valid_keys: dict[int, dict] = {}
 all_users: set[int] = set()
-pending_payments: dict[str, dict] = {} # Lưu mã QR đang chờ thanh toán
 payment_history: dict[int, list] = {}
-user_balances: dict[int, int] = {} # Lưu số dư ví của người dùng
-tracked_messages: list[dict] = [] # Lưu log tin nhắn để xóa tự động
-
-# ── TỰ ĐỘNG CẬP NHẬT PHIÊN ──
-last_game_sessions: dict[str, str] = {}
-tracked_live_messages: dict[tuple[int, int], str] = {}
-
-# ── THEO DÕI THÔNG BÁO HẾT HẠN ──
-notified_expiring_keys: set[int] = set()
+user_balances: dict[int, int] = {}
 
 key_store: dict[str, dict] = {
     "VIP-TEST-2024": {"duration_days": 1,   "used_by": None},
     "VIP-WEEK-001" : {"duration_days": 7,   "used_by": None},
     "VIP-MONTH-001": {"duration_days": 30,  "used_by": None},
-    "VIP-FOREVER-1": {"duration_days": -1,  "used_by": None},  # -1 = vĩnh viễn
+    "VIP-FOREVER-1": {"duration_days": -1,  "used_by": None},
 }
 
 def save_data():
@@ -79,13 +67,11 @@ def save_data():
             "expires": exp.isoformat() if isinstance(exp, datetime) else None
         }
     data = {
-        "valid_keys": vk_json, 
-        "key_store": key_store, 
+        "valid_keys": vk_json,
+        "key_store": key_store,
         "all_users": list(all_users),
-        "pending_payments": pending_payments,
         "payment_history": payment_history,
-        "user_balances": user_balances,
-        "tracked_messages": tracked_messages
+        "user_balances": user_balances
     }
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -94,7 +80,7 @@ def save_data():
         log.error(f"Lỗi lưu file: {e}")
 
 def load_data():
-    global valid_keys, key_store, all_users, pending_payments, payment_history, user_balances, tracked_messages
+    global valid_keys, key_store, all_users, payment_history, user_balances
     if not os.path.exists(DATA_FILE):
         save_data()
         return
@@ -113,75 +99,16 @@ def load_data():
         if "all_users" in data:
             all_users.clear()
             all_users.update(data["all_users"])
-        if "pending_payments" in data:
-            pending_payments.clear()
-            pending_payments.update(data["pending_payments"])
         if "payment_history" in data:
             payment_history.clear()
             payment_history.update({int(k): v for k, v in data["payment_history"].items()})
         if "user_balances" in data:
             user_balances.clear()
             user_balances.update({int(k): int(v) for k, v in data["user_balances"].items()})
-        if "tracked_messages" in data:
-            tracked_messages.clear()
-            tracked_messages.extend(data["tracked_messages"])
     except Exception as e:
         log.error(f"Lỗi đọc file: {e}")
 
-# Gọi ngay khi chạy bot để nạp dữ liệu từ file JSON
 load_data()
-
-class TrackOutgoingMiddleware(BaseRequestMiddleware):
-    async def __call__(self, make_request, bot, method):
-        response = await make_request(bot, method)
-        if isinstance(response, Message):
-            text = response.text or response.caption or ""
-            # Bỏ qua không xóa các thông báo Nạp Tiền, Lịch Sử CK, Thay đổi số dư
-            if not any(k in text for k in ["NẠP TIỀN THÀNH CÔNG", "LỊCH SỬ GIAO DỊCH", "MUA VIP THÀNH CÔNG", "THAY ĐỔI SỐ DƯ"]):
-                tracked_messages.append({
-                    "chat_id": response.chat.id,
-                    "message_id": response.message_id,
-                    "timestamp": datetime.now().isoformat()
-                })
-        return response
-
-class TrackIncomingMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        if isinstance(event, Message):
-            tracked_messages.append({
-                "chat_id": event.chat.id,
-                "message_id": event.message_id,
-                "timestamp": datetime.now().isoformat()
-            })
-        return await handler(event, data)
-
-bot.session.middleware(TrackOutgoingMiddleware())
-dp.message.middleware(TrackIncomingMiddleware())
-
-async def check_expiring_keys():
-    while True:
-        await asyncio.sleep(300)  # Cứ 5 phút kiểm tra 1 lần
-        now = datetime.now()
-        for uid, info in list(valid_keys.items()):
-            exp = info.get("expires")
-            if not exp:
-                continue
-            time_left = exp - now
-            # Nếu thời gian còn lại lớn hơn 0 và nhỏ hơn hoặc bằng 1 giờ (3600 giây)
-            if timedelta(hours=0) < time_left <= timedelta(hours=1):
-                if uid not in notified_expiring_keys:
-                    try:
-                        mins_left = time_left.seconds // 60
-                        await bot.send_message(
-                            uid,
-                            f"⚠️ <b>THÔNG BÁO HẾT HẠN VIP</b> ⚠️\n\nGói VIP của bạn sẽ hết hạn trong khoảng <b>{mins_left} phút</b> nữa ({exp.strftime('%H:%M %d/%m')}).\n👉 Vui lòng gửi lệnh /start và chọn <b>Nạp Tiền</b> hoặc <b>Mua VIP</b> để gia hạn, tránh bị gián đoạn dịch vụ nhé!"
-                        )
-                        notified_expiring_keys.add(uid)
-                    except Exception:
-                        pass
-            elif time_left > timedelta(hours=1) and uid in notified_expiring_keys:
-                # Nếu người dùng đã gia hạn thêm giờ, xóa khỏi danh sách đã thông báo
-                notified_expiring_keys.remove(uid)
 
 # ─────────────────────────────────────────────
 #  DANH SÁCH GAME
@@ -218,11 +145,9 @@ class AdminState(StatesGroup):
     genkeys_days = State()
     delkey_key = State()
     broadcast_text = State()
-    addmoney_uid = State()
-    addmoney_amount = State()
 
 # ─────────────────────────────────────────────
-#  HELPER: Kiểm tra key còn hiệu lực
+#  HELPER
 # ─────────────────────────────────────────────
 def is_authorized(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -231,7 +156,7 @@ def is_authorized(user_id: int) -> bool:
     if not info:
         return False
     exp = info.get("expires")
-    if exp is None:   # vĩnh viễn
+    if exp is None:
         return True
     return datetime.now() < exp
 
@@ -250,41 +175,40 @@ def key_expire_str(user_id: int) -> str:
     return f"{days} ngày {hours} giờ"
 
 def clean_memo(name: str) -> str:
-    """Xóa dấu Tiếng Việt và ký tự đặc biệt để làm nội dung chuyển khoản"""
     n = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('utf-8')
     clean = ''.join(e for e in n if e.isalnum()).upper()
     return clean if clean else "USER"
 
+VN_TZ = timezone(timedelta(hours=7))
+
+def now_vn() -> datetime:
+    """Trả về datetime hiện tại theo giờ Việt Nam (UTC+7)."""
+    return datetime.now(VN_TZ)
+
 # ─────────────────────────────────────────────
 #  HELPER: Gọi API dự đoán
-#  Bạn thay URL thật vào đây
 # ─────────────────────────────────────────────
 def fetch_prediction(game_id: str) -> dict:
-    """
-    Gọi API lấy dữ liệu dự đoán thực tế.
-    """
-    # Xử lý API thật cho Tài Xỉu Sunwin
     if game_id == "sunwin_tx":
         try:
             resp = requests.get("https://sunwinsaygex-vd0m.onrender.com/api/sun", timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 return {
-                    "game_id"       : game_id,
+                    "game_id"        : game_id,
                     "current_session": data.get("phien", 0),
-                    "dice"          : [data.get("xuc_xac_1", 0), data.get("xuc_xac_2", 0), data.get("xuc_xac_3", 0)],
-                    "total"         : data.get("tong", 0),
-                    "result"        : str(data.get("ket_qua", "")).upper(),
-                    "next_session"  : data.get("phien_hien_tai", 0),
-                    "prediction"    : str(data.get("du_doan", "")).upper(),
-                    "confidence"    : random.randint(75, 95), # API chưa trả về độ tin cậy, tự tạo ngẫu nhiên
-                    "bridge_type"   : "Cầu Hệ Thống",
-                    "pattern"       : "N/A",
+                    "dice"           : [data.get("xuc_xac_1", 0), data.get("xuc_xac_2", 0), data.get("xuc_xac_3", 0)],
+                    "total"          : data.get("tong", 0),
+                    "result"         : str(data.get("ket_qua", "")).upper(),
+                    "next_session"   : data.get("phien_hien_tai", 0),
+                    "prediction"     : str(data.get("du_doan", "")).upper(),
+                    "confidence"     : random.randint(75, 95),
+                    "bridge_type"    : "Cầu Hệ Thống",
+                    "pattern"        : "N/A",
                 }
         except Exception as e:
             log.warning(f"API error for {game_id}: {e}")
 
-    # Xử lý API thật cho Sicbo Sunwin
     elif game_id == "sunwin_sicbo":
         try:
             resp = requests.get("https://sicbosunwin.onrender.com/api/sicbo/sunwin", timeout=5)
@@ -292,206 +216,41 @@ def fetch_prediction(game_id: str) -> dict:
                 data = resp.json()
                 conf_str = data.get("do_tin_cay", "80%")
                 conf = int(float(conf_str.replace("%", ""))) if "%" in conf_str else 80
-                
                 return {
-                    "game_id"       : game_id,
+                    "game_id"        : game_id,
                     "current_session": str(data.get("Phien", "")).replace("#", ""),
-                    "dice"          : [data.get("Xuc_xac_1", 0), data.get("Xuc_xac_2", 0), data.get("Xuc_xac_3", 0)],
-                    "total"         : data.get("Tong", 0),
-                    "result"        : str(data.get("Ket_qua", "")).upper(),
-                    "next_session"  : data.get("phien_hien_tai", 0),
-                    "prediction"    : str(data.get("du_doan", "")).upper(),
-                    "confidence"    : conf,
-                    "bridge_type"   : "Cầu Thông Minh",
-                    "pattern"       : "N/A",
-                    "position"      : str(data.get("dudoan_vi", "")),
+                    "dice"           : [data.get("Xuc_xac_1", 0), data.get("Xuc_xac_2", 0), data.get("Xuc_xac_3", 0)],
+                    "total"          : data.get("Tong", 0),
+                    "result"         : str(data.get("Ket_qua", "")).upper(),
+                    "next_session"   : data.get("phien_hien_tai", 0),
+                    "prediction"     : str(data.get("du_doan", "")).upper(),
+                    "confidence"     : conf,
+                    "bridge_type"    : "Cầu Thông Minh",
+                    "pattern"        : "N/A",
+                    "position"       : str(data.get("dudoan_vi", "")),
                 }
         except Exception as e:
             log.warning(f"API error for {game_id}: {e}")
 
-    # Xử lý API thật cho Luck8
-    elif game_id == "luck8":
-        try:
-            resp = requests.get("https://luck8md5vip-4vph.onrender.com/api/taixiu", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                conf_str = str(data.get("doTinCay", "80%"))
-                conf = int(float(conf_str.replace("%", ""))) if "%" in conf_str else 80
-                dice = data.get("xucXac", [0, 0, 0])
-                total = sum(dice) if isinstance(dice, list) else 0
-                
-                return {
-                    "game_id"       : game_id,
-                    "current_session": data.get("phien", 0),
-                    "dice"          : dice,
-                    "total"         : total,
-                    "result"        : str(data.get("ketQua", "")).upper(),
-                    "next_session"  : data.get("phienHienTai", 0),
-                    "prediction"    : str(data.get("duDoan", "")).upper(),
-                    "confidence"    : conf,
-                    "bridge_type"   : "Cầu AI",
-                    "pattern"       : data.get("pattern", "N/A"),
-                }
-        except Exception as e:
-            log.warning(f"API error for {game_id}: {e}")
-
-    # Xử lý API thật cho Sicbo Hitclub
-    elif game_id == "hit_sicbo":
-        try:
-            resp = requests.get("https://sichit.onrender.com/sicbo", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                conf_str = data.get("do_tin_cay", "80%")
-                conf = int(float(conf_str.replace("%", ""))) if "%" in conf_str else 80
-                
-                return {
-                    "game_id"       : game_id,
-                    "current_session": str(data.get("phien", "")).replace("#", ""),
-                    "dice"          : [data.get("xuc_xac_1", 0), data.get("xuc_xac_2", 0), data.get("xuc_xac_3", 0)],
-                    "total"         : data.get("tong", 0),
-                    "result"        : str(data.get("ket_qua", "")).upper(),
-                    "next_session"  : str(data.get("phien_hien_tai", "")).replace("#", ""),
-                    "prediction"    : str(data.get("du_doan", "")).upper(),
-                    "confidence"    : conf,
-                    "bridge_type"   : "Cầu Phân Tích",
-                    "pattern"       : "N/A",
-                    "position"      : str(data.get("dudoan_vi", "")),
-                }
-        except Exception as e:
-            log.warning(f"API error for {game_id}: {e}")
-
-    # Xử lý API thật cho Baccarat Sexy
-    elif game_id.startswith("bcr_"):
-        table = game_id.split("_")[1]
-        try:
-            resp = requests.get(f"https://bcrsexysewpro.onrender.com/apibcr/{table}", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                table_list = data.get("Danh sách", [])
-                item = table_list[0] if table_list else {}
-                
-                conf_str = item.get("Độ tin cậy", "80%")
-                conf = int(float(conf_str.replace("%", ""))) if "%" in conf_str else 80
-                
-                bridge_types = item.get("Loại cầu", ["N/A"])
-                bridge_str = ", ".join(bridge_types) if isinstance(bridge_types, list) else str(bridge_types)
-                
-                return {
-                    "game_id"       : game_id,
-                    "current_session": data.get("Số phiên", 0),
-                    "dice"          : [0, 0, 0],
-                    "total"         : 0,
-                    "result"        : "N/A",
-                    "baccarat_result": item.get("Trạng thái", "Đang cập nhật..."),
-                    "next_session"  : data.get("Số phiên", 0) + 1,
-                    "prediction"    : str(item.get("Dự đoán", "")).upper(),
-                    "confidence"    : conf,
-                    "bridge_type"   : bridge_str,
-                    "pattern"       : str(item.get("Độ mạnh", "N/A")),
-                }
-        except Exception as e:
-            log.warning(f"API error for {game_id}: {e}")
-
-    # Xử lý API thật cho Tài Xỉu B52
-    elif game_id == "b52_tx":
-        try:
-            resp = requests.get("https://b52-taixiu-l69b.onrender.com/api/taixiu", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                conf_str = str(data.get("Do_tin_cay", "80%"))
-                conf = int(float(conf_str.replace("%", ""))) if "%" in conf_str else 80
-                
-                # Làm ngắn chuỗi Pattern (Lấy 20 kết quả gần nhất)
-                pattern_str = str(data.get("Pattern", "N/A")).upper()
-                pattern_short = pattern_str[-20:] if len(pattern_str) > 20 else pattern_str
-                
-                return {
-                    "game_id"       : game_id,
-                    "current_session": data.get("Phien", 0),
-                    "dice"          : [data.get("Xuc_xac_1", 0), data.get("Xuc_xac_2", 0), data.get("Xuc_xac_3", 0)],
-                    "total"         : data.get("Tong", 0),
-                    "result"        : str(data.get("Ket_qua", "")).upper(),
-                    "next_session"  : data.get("phien_hien_tai", 0),
-                    "prediction"    : str(data.get("Du_doan", "")).upper(),
-                    "confidence"    : conf,
-                    "bridge_type"   : "Cầu B52 AI",
-                    "pattern"       : pattern_short,
-                }
-        except Exception as e:
-            log.warning(f"API error for {game_id}: {e}")
-
-    # Xử lý API thật cho lc79 Hũ
-    elif game_id == "lc79_hu":
-        try:
-            resp = requests.get("http://160.250.137.196:5000/lc79-hu", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                conf_str = str(data.get("ti_le", "80%"))
-                conf = int(float(conf_str.replace("%", ""))) if "%" in conf_str else 80
-                next_session = int(data.get("phien_hien_tai", 0))
-                
-                return {
-                    "game_id"       : game_id,
-                    "current_session": next_session - 1, # Suy luận phiên trước đó
-                    "dice"          : ["?", "?", "?"],
-                    "total"         : "N/A",
-                    "result"        : "N/A",
-                    "next_session"  : next_session,
-                    "prediction"    : str(data.get("du_doan", "")).upper(),
-                    "confidence"    : conf,
-                    "bridge_type"   : "Cầu LC79 Hũ",
-                    "pattern"       : "N/A",
-                }
-        except Exception as e:
-            log.warning(f"API error for {game_id}: {e}")
-
-    # Xử lý API thật cho lc79 MD5
-    elif game_id == "lc79_md5":
-        try:
-            resp = requests.get("http://160.250.137.196:5000/lc79-md5", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                conf_str = str(data.get("ti_le", "80%"))
-                conf = int(float(conf_str.replace("%", ""))) if "%" in conf_str else 80
-                next_session = int(data.get("phien_hien_tai", 0))
-
-                return {
-                    "game_id"       : game_id,
-                    "current_session": next_session - 1, # Suy luận phiên trước đó
-                    "dice"          : ["?", "?", "?"],
-                    "total"         : "N/A",
-                    "result"        : "N/A",
-                    "next_session"  : next_session,
-                    "prediction"    : str(data.get("du_doan", "")).upper(),
-                    "confidence"    : conf,
-                    "bridge_type"   : "Cầu LC79 MD5",
-                    "pattern"       : "N/A",
-                }
-        except Exception as e:
-            log.warning(f"API error for {game_id}: {e}")
-
-    # ── DEMO DATA (dành cho các game chưa có API hoặc dự phòng khi API lỗi) ──
     dice = [random.randint(1, 6) for _ in range(3)]
     total = sum(dice)
     result = "TÀI" if total >= 11 else "XỈU"
     patterns = ["Cầu bệt", "Cầu đảo", "Cầu 1-1", "Cầu 2-2", "Cầu 3-3", "Cầu zigzag"]
     pattern_seq = "T-T-X-T" if result == "TÀI" else "X-X-T-X"
-    current_session = int(datetime.now().timestamp() // 50) # Phiên ảo (tự đổi mỗi 50s cho demo)
-
+    current_session = random.randint(100000, 999999)
     return {
-        "game_id"       : game_id,
+        "game_id"        : game_id,
         "current_session": current_session,
-        "dice"          : dice,
-        "total"         : total,
-        "result"        : result,
-        "next_session"  : current_session + 1,
-        "prediction"    : random.choice(["Player", "Banker"]) if "bcr" in game_id else ("TÀI" if random.random() > 0.45 else "XỈU"),
-        "confidence"    : random.randint(72, 95),
-        "bridge_type"   : random.choice(patterns),
-        "pattern"       : pattern_seq,
-        # Sicbo / Baccarat extras
-        "position"      : random.choice(["Cửa Tài", "Cửa Xỉu", "Cửa Chẵn", "Cửa Lẻ"]),
-        "baccarat_result": random.choice(["Thắng ✅", "Thua ❌", "Hoà ⚪"]),
+        "dice"           : dice,
+        "total"          : total,
+        "result"         : result,
+        "next_session"   : current_session + 1,
+        "prediction"     : "TÀI" if random.random() > 0.45 else "XỈU",
+        "confidence"     : random.randint(72, 95),
+        "bridge_type"    : random.choice(patterns),
+        "pattern"        : pattern_seq,
+        "position"       : random.choice(["Cửa Tài", "Cửa Xỉu", "Cửa Chẵn", "Cửa Lẻ"]),
+        "baccarat_result": random.choice(["Player", "Banker", "Tie"]),
     }
 
 # ─────────────────────────────────────────────
@@ -507,7 +266,6 @@ def kb_start(authorized: bool) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🎮 Danh sách Game", callback_data="game_list")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def kb_help() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Nạp Tiền", callback_data="deposit"),
@@ -517,7 +275,6 @@ def kb_help() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📜 Lịch sử giao dịch", callback_data="history")],
         [InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")],
     ])
-
 
 def kb_games() -> InlineKeyboardMarkup:
     rows = []
@@ -529,6 +286,13 @@ def kb_games() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def kb_game_result(game_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Cập nhật dự đoán", callback_data=f"game_{game_id}")],
+        [InlineKeyboardButton(text="◀️ Quay lại danh sách", callback_data="game_list")],
+        [InlineKeyboardButton(text="🏠 Menu Chính", callback_data="home")],
+    ])
+
 def kb_admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Thống Kê", callback_data="admin_stats"),
@@ -537,10 +301,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🎲 Tạo Nhiều Key", callback_data="admin_genkeys")],
         [InlineKeyboardButton(text="❌ Xóa 1 Key", callback_data="admin_delkey"),
          InlineKeyboardButton(text="🗑 Xóa Toàn Bộ", callback_data="admin_clear_keys")],
-        [
-            InlineKeyboardButton(text="📢 Gửi Thông Báo", callback_data="admin_broadcast"),
-            InlineKeyboardButton(text="💰 Cộng/Trừ Tiền", callback_data="admin_addmoney")],
-        [InlineKeyboardButton(text="⏳ Hóa Đơn Chờ", callback_data="admin_pending_payments")],
+        [InlineKeyboardButton(text="📢 Gửi Thông Báo", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="Đóng Menu", callback_data="admin_close")]
     ])
 
@@ -577,9 +338,8 @@ def format_taixiu(game: dict, data: dict) -> str:
         f"🔄 Loại cầu: <i>{data['bridge_type']}</i>\n"
         f"📉 Pattern: <code>{data['pattern']}</code>\n"
         f"{'─'*28}\n"
-        f"⏱ Cập nhật: {datetime.now().strftime('%H:%M:%S')}"
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
     )
-
 
 def format_sicbo(game: dict, data: dict) -> str:
     dice = data["dice"]
@@ -599,9 +359,8 @@ def format_sicbo(game: dict, data: dict) -> str:
         f"📊 Độ tin cậy: <b>{conf}%</b>\n"
         f"   <code>[{conf_bar}]</code>\n"
         f"{'─'*28}\n"
-        f"⏱ Cập nhật: {datetime.now().strftime('%H:%M:%S')}"
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
     )
-
 
 def format_baccarat(game: dict, data: dict) -> str:
     conf = data["confidence"]
@@ -610,18 +369,17 @@ def format_baccarat(game: dict, data: dict) -> str:
         f"🃏 <b>GAME: {game['name']}</b>\n"
         f"{'─'*28}\n"
         f"🔹 Phiên hiện tại: <code>{data['current_session']}</code>\n"
-        f"🔹 Trạng thái cầu: <b>{data.get('baccarat_result', 'N/A')}</b>\n"
+        f"🔹 Kết quả: <b>{data['baccarat_result']}</b>\n"
         f"{'─'*28}\n"
         f"🔮 Phiên dự đoán: <code>{data['next_session']}</code>\n"
-        f"🎯 Dự đoán: <b>{data['prediction']}</b>\n"
+        f"🎯 Dự đoán: <b>{data['baccarat_result']}</b>\n"
         f"📊 Độ tin cậy: <b>{conf}%</b>\n"
         f"   <code>[{conf_bar}]</code>\n"
         f"🔄 Loại cầu: <i>{data['bridge_type']}</i>\n"
-        f"📉 Sức mạnh: <code>{data['pattern']}</code>\n"
+        f"📉 Pattern: <code>{data['pattern']}</code>\n"
         f"{'─'*28}\n"
-        f"⏱ Cập nhật: {datetime.now().strftime('%H:%M:%S')}"
+        f"⏱ Cập nhật: {now_vn().strftime('%H:%M:%S')} (VN)"
     )
-
 
 def format_result(game: dict, data: dict) -> str:
     t = game["type"]
@@ -638,7 +396,6 @@ def welcome_text(user) -> str:
     user_id = user.id
     name = user.full_name
     username = f" (@{user.username})" if user.username else ""
-    
     status = "✅ <b>Đã kích hoạt</b>" if is_authorized(user_id) else "❌ <b>Chưa kích hoạt</b>"
     expire = key_expire_str(user_id) if is_authorized(user_id) else "—"
     balance = user_balances.get(user_id, 0)
@@ -660,7 +417,7 @@ def welcome_text(user) -> str:
         "✔️ <b>Baccarat:</b> Phân tích cầu Player/Banker.\n"
         "⚡️ Cập nhật kết quả & dự đoán thời gian thực!\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💎 <b>BẢNG GIÁ KEY VIP (MUA LIÊN HỆ ADMIN)</b>\n"
+        "💎 <b>BẢNG GIÁ KEY VIP</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📅  1 Ngày      ──────  <b>30.000đ</b>\n"
         "📆  1 Tuần      ──────  <b>120.000đ</b>\n"
@@ -678,7 +435,6 @@ app = FastAPI(redirect_slashes=False)
 # ─────────────────────────────────────────────
 #  HANDLERS
 # ─────────────────────────────────────────────
-
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
@@ -691,15 +447,12 @@ async def cmd_start(msg: Message, state: FSMContext):
         reply_markup=kb_start(is_authorized(uid))
     )
 
-
 @dp.callback_query(F.data == "home")
 async def cb_home(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     uid = cb.from_user.id
     text = welcome_text(cb.from_user)
     markup = kb_start(is_authorized(uid))
-    
-    # Xử lý lỗi nếu đang ở giao diện ảnh (Mã QR) không thể edit text
     if cb.message.photo:
         await cb.message.delete()
         await cb.message.answer(text, reply_markup=markup)
@@ -707,37 +460,38 @@ async def cb_home(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text(text, reply_markup=markup)
     await cb.answer()
 
-
-# ── TRỢ GIÚP & CHỨC NĂNG KHÁC ──
 @dp.message(Command("help"))
 async def cmd_help(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(
-        "ℹ️ <b>TRỢ GIÚP & CHỨC NĂNG KHÁC</b>\n\n"
-        "Vui lòng chọn các chức năng bên dưới:",
+        "ℹ️ <b>TRỢ GIÚP & CHỨC NĂNG KHÁC</b>\n\nVui lòng chọn các chức năng bên dưới:",
         reply_markup=kb_help()
     )
-
 
 @dp.callback_query(F.data == "help")
 async def cb_help(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text(
-        "ℹ️ <b>TRỢ GIÚP & CHỨC NĂNG KHÁC</b>\n\n"
-        "Vui lòng chọn các chức năng bên dưới:",
+        "ℹ️ <b>TRỢ GIÚP & CHỨC NĂNG KHÁC</b>\n\nVui lòng chọn các chức năng bên dưới:",
         reply_markup=kb_help()
     )
     await cb.answer()
 
-
+# ─────────────────────────────────────────────
+#  NẠP TIỀN — ✅ ĐÃ FIX
+#  Dùng "NAP {uid}" làm nội dung CK
+#  → Không cần pending_payments → không mất data khi Render restart
+# ─────────────────────────────────────────────
 @dp.callback_query(F.data == "deposit")
 async def cb_deposit(cb: CallbackQuery):
+    uid = cb.from_user.id
     text = (
-        "💰 <b>NẠP TIỀN VÀO SỐ DƯ</b>\n\n"
-        "Vui lòng chọn số tiền bạn muốn nạp. Tiền sẽ được cộng vào số dư tài khoản của bạn để mua VIP."
+        f"💰 <b>NẠP TIỀN VÀO SỐ DƯ</b>\n\n"
+        f"📝 Nội dung chuyển khoản của bạn: <code>NAP {uid}</code>\n\n"
+        "Vui lòng chọn số tiền bạn muốn nạp:"
     )
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="50.000đ", callback_data="pay_50000"),
+        [InlineKeyboardButton(text="50.000đ",  callback_data="pay_50000"),
          InlineKeyboardButton(text="100.000đ", callback_data="pay_100000")],
         [InlineKeyboardButton(text="200.000đ", callback_data="pay_200000"),
          InlineKeyboardButton(text="500.000đ", callback_data="pay_500000")],
@@ -745,20 +499,25 @@ async def cb_deposit(cb: CallbackQuery):
     ]))
     await cb.answer()
 
-
 @dp.callback_query(F.data.startswith("pay_"))
 async def cb_pay(cb: CallbackQuery):
     amount = int(cb.data.split("_")[1])
-    
-    # Tạo Nội dung ngẫu nhiên: TÊN (không dấu) + 4 số ngẫu nhiên
-    name_clean = clean_memo(cb.from_user.first_name)[:8]
-    rand_code = ''.join(random.choices(string.digits, k=4))
-    memo = f"{name_clean}{rand_code}"
-    
-    qr_url = f"https://img.vietqr.io/image/MB-{BANK_STK}-compact2.png?amount={amount}&addInfo={memo}"
-    
+    uid = cb.from_user.id
+
+    # ✅ Thêm 4 ký tự random để tránh trùng nội dung CK
+    rand_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    memo = f"NAP {uid} {rand_suffix}"
+
+    expire_time = now_vn() + timedelta(minutes=10)
+    expire_str = expire_time.strftime('%H:%M:%S')
+
+    qr_url = (
+        f"https://img.vietqr.io/image/MB-{BANK_STK}-compact2.png"
+        f"?amount={amount}&addInfo={memo}"
+    )
+
     await cb.message.delete()
-    sent_msg = await cb.message.answer_photo(
+    sent = await cb.message.answer_photo(
         photo=qr_url,
         caption=(
             f"💰 <b>HÓA ĐƠN THANH TOÁN TỰ ĐỘNG</b>\n\n"
@@ -766,22 +525,40 @@ async def cb_pay(cb: CallbackQuery):
             f"💳 Số tài khoản: <code>{BANK_STK}</code>\n"
             f"💵 Số tiền: <b>{amount:,}đ</b>\n"
             f"📝 Nội dung CK: <code>{memo}</code>\n\n"
-            f"<i>⚠️ Bạn vui lòng chuyển ĐÚNG SỐ TIỀN VÀ NỘI DUNG. Hệ thống sẽ tự động cộng số dư cho bạn ngay lập tức!</i>"
+            f"⏳ <b>Mã QR hết hạn lúc: {expire_str} (10 phút)</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📖 <b>HƯỚNG DẪN NẠP TIỀN</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"1️⃣ Mở app ngân hàng → <b>Chuyển khoản QR</b>\n"
+            f"2️⃣ Quét mã QR ở trên\n"
+            f"3️⃣ Kiểm tra <b>số tiền</b> và <b>nội dung CK</b> đúng chưa\n"
+            f"4️⃣ Xác nhận chuyển khoản\n"
+            f"5️⃣ Chụp bill → <b>Gửi vào đây</b>\n\n"
+            f"<i>⚠️ Ghi ĐÚNG nội dung CK bên trên — hệ thống tự động cộng số dư!</i>"
         ),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")
+        ]])
     )
-    
-    # Lưu vào database chờ duyệt và theo dõi chat_id, message_id để xóa
-    pending_payments[memo] = {
-        "uid": cb.from_user.id, 
-        "amount": amount,
-        "created_at": datetime.now().isoformat(),
-        "chat_id": sent_msg.chat.id,
-        "message_id": sent_msg.message_id
-    }
-    save_data()
     await cb.answer()
 
+    # ✅ Tự xóa QR sau 10 phút
+    async def expire_qr():
+        await asyncio.sleep(600)
+        try:
+            await sent.delete()
+            await cb.message.answer(
+                "⏰ <b>Mã QR đã hết hạn!</b>\n\n"
+                "Vui lòng tạo mã mới để tiếp tục nạp tiền.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 Tạo QR mới", callback_data="deposit")],
+                    [InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]
+                ])
+            )
+        except Exception:
+            pass
+
+    asyncio.create_task(expire_qr())
 
 @dp.callback_query(F.data == "account")
 async def cb_account(cb: CallbackQuery):
@@ -793,24 +570,20 @@ async def cb_account(cb: CallbackQuery):
     )
     await cb.answer()
 
-
 @dp.callback_query(F.data == "history")
 async def cb_history(cb: CallbackQuery):
     uid = cb.from_user.id
     history = payment_history.get(uid, [])
-    
     if not history:
         text = "📜 <b>LỊCH SỬ GIAO DỊCH</b>\n\nBạn chưa có giao dịch nào."
     else:
         lines = ["📜 <b>LỊCH SỬ GIAO DỊCH</b>\n"]
-        # Show max 10 recent transactions
         for item in history[:10]:
             date_obj = datetime.fromisoformat(item['date'])
             date_str = date_obj.strftime('%d/%m/%Y %H:%M')
             lines.append(f"<b>- {item['description']}</b>")
             lines.append(f"  <i>({date_str})</i>: {item['details']}")
         text = "\n".join(lines)
-        
     await cb.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -819,8 +592,7 @@ async def cb_history(cb: CallbackQuery):
     )
     await cb.answer()
 
-
-# ── TÍNH NĂNG MUA VIP ──
+# ── MUA VIP ──
 @dp.callback_query(F.data == "buy_vip_menu")
 async def cb_buy_vip_menu(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -828,23 +600,21 @@ async def cb_buy_vip_menu(cb: CallbackQuery):
     text = (
         f"🛒 <b>MUA GÓI VIP BẰNG SỐ DƯ</b>\n\n"
         f"💰 Số dư hiện tại: <b>{bal:,.0f}đ</b>\n\n"
-        "Vui lòng chọn gói VIP bạn muốn mua. Nếu không đủ tiền, hãy vào mục Nạp Tiền nhé!"
+        "Vui lòng chọn gói VIP bạn muốn mua.\nNếu không đủ tiền, hãy vào mục Nạp Tiền nhé!"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 Ngày - 30.000đ", callback_data="buy_vip_1")],
-        [InlineKeyboardButton(text="7 Ngày - 120.000đ", callback_data="buy_vip_7")],
-        [InlineKeyboardButton(text="1 Tháng - 220.000đ", callback_data="buy_vip_30")],
-        [InlineKeyboardButton(text="Vĩnh viễn - 380.000đ", callback_data="buy_vip_999")],
-        [InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]
+        [InlineKeyboardButton(text="1 Ngày - 30.000đ",      callback_data="buy_vip_1")],
+        [InlineKeyboardButton(text="7 Ngày - 120.000đ",     callback_data="buy_vip_7")],
+        [InlineKeyboardButton(text="1 Tháng - 220.000đ",    callback_data="buy_vip_30")],
+        [InlineKeyboardButton(text="Vĩnh viễn - 380.000đ",  callback_data="buy_vip_999")],
+        [InlineKeyboardButton(text="🏠 Về Menu Chính",       callback_data="home")]
     ])
-    
     if cb.message.photo:
         await cb.message.delete()
         await cb.message.answer(text, reply_markup=kb)
     else:
         await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
-
 
 @dp.callback_query(F.data.startswith("buy_vip_") & ~F.data.contains("menu"))
 async def cb_process_buy_vip(cb: CallbackQuery):
@@ -855,27 +625,23 @@ async def cb_process_buy_vip(cb: CallbackQuery):
     bal = user_balances.get(uid, 0)
 
     if bal < price:
-        await cb.answer(f"❌ Số dư không đủ! Bạn cần thêm {price - bal:,.0f}đ để mua gói này.", show_alert=True)
+        await cb.answer(f"❌ Số dư không đủ! Bạn cần thêm {price - bal:,.0f}đ.", show_alert=True)
         return
 
-    # Trừ tiền
     user_balances[uid] -= price
-
-    # Gia hạn ngày VIP
     info = valid_keys.get(uid)
     current_exp = info.get("expires") if info else None
-    
+
     if days == 999:
         expires = None
     else:
         if current_exp and current_exp > datetime.now():
-            expires = current_exp + timedelta(days=days)  # Cộng dồn
+            expires = current_exp + timedelta(days=days)
         else:
             expires = datetime.now() + timedelta(days=days)
 
     valid_keys[uid] = {"key": "BOUGHT_FROM_BALANCE", "expires": expires}
-    
-    # Ghi lịch sử
+
     if uid not in payment_history:
         payment_history[uid] = []
     days_text = "Vĩnh viễn" if days == 999 else f"+{days} ngày"
@@ -892,7 +658,9 @@ async def cb_process_buy_vip(cb: CallbackQuery):
         f"Gói mua: <b>{days_text}</b>\n"
         f"Số dư còn lại: <b>{user_balances[uid]:,.0f}đ</b>\n"
         f"⏳ Hạn sử dụng mới: <b>{exp_str}</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")
+        ]])
     )
     await cb.answer()
 
@@ -910,40 +678,32 @@ async def cb_enter_key(cb: CallbackQuery, state: FSMContext):
     )
     await cb.answer()
 
-
 @dp.message(UserState.waiting_key)
 async def process_key(msg: Message, state: FSMContext):
     await state.clear()
-    uid  = msg.from_user.id
-    key  = msg.text.strip()
+    uid = msg.from_user.id
+    key = msg.text.strip()
 
     if key not in key_store:
         await msg.answer(
-            "❌ <b>Key không hợp lệ!</b>\n\n"
-            "Vui lòng kiểm tra lại hoặc liên hệ Admin mua Key mới.",
+            "❌ <b>Key không hợp lệ!</b>\n\nVui lòng kiểm tra lại hoặc liên hệ Admin mua Key mới.",
             reply_markup=kb_start(False)
         )
         return
 
     info = key_store[key]
-
     if info["used_by"] is not None and info["used_by"] != uid:
         await msg.answer(
-            "⚠️ <b>Key đã được sử dụng!</b>\n\n"
-            f"Key <code>{key}</code> đã được kích hoạt bởi một người dùng khác.\n"
-            "Mỗi key chỉ dùng được cho một tài khoản duy nhất.\n\n"
-            "Vui lòng liên hệ Admin để được hỗ trợ nếu bạn cho rằng đây là nhầm lẫn.",
+            "⚠️ <b>Key này đã được sử dụng bởi tài khoản khác!</b>",
             reply_markup=kb_start(False)
         )
         return
 
-    # Kích hoạt key
     days = info["duration_days"]
     expires = None if days == -1 else datetime.now() + timedelta(days=days)
     valid_keys[uid] = {"key": key, "expires": expires}
     key_store[key]["used_by"] = uid
 
-    # Thêm vào lịch sử giao dịch
     if uid not in payment_history:
         payment_history[uid] = []
     days_text = "Vĩnh viễn" if days == -1 else f"+{days} ngày"
@@ -962,8 +722,6 @@ async def process_key(msg: Message, state: FSMContext):
         f"Chào mừng bạn đến với VIP Predict Bot! 🎉",
         reply_markup=kb_start(True)
     )
-    
-    # Gửi thông báo cho Admin
     try:
         user_name = msg.from_user.full_name
         username = f" (@{msg.from_user.username})" if msg.from_user.username else ""
@@ -978,96 +736,47 @@ async def process_key(msg: Message, state: FSMContext):
     except Exception as e:
         log.error(f"Lỗi gửi thông báo cho admin: {e}")
 
-
 # ── DANH SÁCH GAME ──
 @dp.callback_query(F.data == "game_list")
 async def cb_game_list(cb: CallbackQuery):
     uid = cb.from_user.id
     if not is_authorized(uid):
-        await cb.message.edit_text(
-            "⛔️ <b>TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
-            "Tài khoản của bạn chưa được kích hoạt VIP hoặc đã hết hạn.\n\n"
-            "Vui lòng quay về Menu chính và chọn <b>Nhập Key</b> hoặc <b>Nạp Tiền</b> để tiếp tục sử dụng.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]
-            ])
-        )
-        await cb.answer()
+        await cb.answer("❌ Bạn chưa có Key hợp lệ!", show_alert=True)
         return
     await cb.message.edit_text(
-        "🎮 <b>DANH SÁCH GAME HỖ TRỢ</b>\n\n"
-        "Chọn game bạn muốn xem dự đoán:",
+        "🎮 <b>DANH SÁCH GAME HỖ TRỢ</b>\n\nChọn game bạn muốn xem dự đoán:",
         reply_markup=kb_games()
     )
     await cb.answer()
 
-
-# ── XEM DỰ ĐOÁN GAME ──
 @dp.callback_query(F.data.startswith("game_"))
 async def cb_game(cb: CallbackQuery):
     uid     = cb.from_user.id
-    game_id = cb.data[5:]   # strip "game_"
-
+    game_id = cb.data[5:]
     if not is_authorized(uid):
-        await cb.message.edit_text(
-            "⛔️ <b>KEY HẾT HẠN</b>\n\n"
-            "Key VIP của bạn đã hết hạn hoặc chưa được kích hoạt. Bạn không thể xem dự đoán.\n\n"
-            "Vui lòng quay về Menu chính và chọn <b>Nhập Key</b> hoặc <b>Nạp Tiền</b> để gia hạn.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Về Menu Chính", callback_data="home")]
-            ])
-        )
-        await cb.answer()
+        await cb.answer("❌ Key hết hạn hoặc chưa kích hoạt!", show_alert=True)
         return
-
-    # Nếu chọn Sexy Baccarat, hiển thị menu chọn bàn (10 bàn)
-    if game_id == "baccarat_sexy":
-        rows = []
-        for i in range(1, 11, 2):
-            rows.append([
-                InlineKeyboardButton(text=f"Bàn {i}", callback_data=f"game_bcr_{i}"),
-                InlineKeyboardButton(text=f"Bàn {i+1}", callback_data=f"game_bcr_{i+1}")
-            ])
-        rows.append([InlineKeyboardButton(text="◀️ Quay lại", callback_data="game_list")])
-        await cb.message.edit_text(
-            "👠 <b>CHỌN BÀN BACCARAT SEXY</b>\n\nVui lòng chọn bàn bạn muốn xem dự đoán:", 
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-        )
-        await cb.answer()
-        return
-
-    if game_id.startswith("bcr_"):
-        table = game_id.split("_")[1]
-        game = {"id": game_id, "name": f"👠 Baccarat Sexy (Bàn {table})", "type": "baccarat"}
-    else:
-        game = GAME_MAP.get(game_id)
-        
+    game = GAME_MAP.get(game_id)
     if not game:
         await cb.answer("Game không tồn tại.", show_alert=True)
         return
-
     await cb.answer("⏳ Đang tải dự đoán...")
-
     data = await asyncio.to_thread(fetch_prediction, game_id)
     text = format_result(game, data)
+    await cb.message.edit_text(text, reply_markup=kb_game_result(game_id))
 
-    await cb.message.edit_text(text)
-    
-    # Lưu vào danh sách theo dõi live để tự động update
-    tracked_live_messages[(cb.message.chat.id, cb.message.message_id)] = game_id
-    last_game_sessions[game_id] = str(data.get("current_session"))
-
-# ── ADMIN: Menu lệnh ──
+# ── ADMIN MENU ──
 @dp.message(Command("menu"))
 async def cmd_menu(msg: Message):
     if msg.from_user.id != ADMIN_ID:
-        await msg.answer(f"⛔ <b>Lỗi:</b> Bạn không phải là Admin!\n\n<i>ID tài khoản của bạn là:</i> <code>{msg.from_user.id}</code>\n\n👉 Hãy copy dòng ID này, mở file <b>bot.py</b> tìm đến dòng số 36 và sửa thành:\n<code>ADMIN_ID = {msg.from_user.id}</code>\nSau đó khởi động lại bot!")
+        await msg.answer(
+            f"⛔ <b>Lỗi:</b> Bạn không phải là Admin!\n\n"
+            f"<i>ID của bạn là:</i> <code>{msg.from_user.id}</code>\n\n"
+            f"👉 Mở file <b>bot.py</b>, sửa dòng <code>ADMIN_ID</code> thành:\n"
+            f"<code>ADMIN_ID = {msg.from_user.id}</code>"
+        )
         return
-        
-    text = (
-        "🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠\n\nChọn một chức năng bên dưới:"
-    )
-    await msg.answer(text, reply_markup=kb_admin_menu())
+    await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠\n\nChọn một chức năng:", reply_markup=kb_admin_menu())
 
 @dp.callback_query(F.data == "admin_close")
 async def cb_admin_close(cb: CallbackQuery):
@@ -1078,7 +787,6 @@ async def cb_admin_cancel(cb: CallbackQuery, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
         return
-
     await state.clear()
     await cb.message.edit_text(
         "🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠\n\nĐã hủy thao tác.",
@@ -1086,41 +794,18 @@ async def cb_admin_cancel(cb: CallbackQuery, state: FSMContext):
     )
     await cb.answer("Đã hủy.")
 
-# --- Các chức năng Admin ---
-
 @dp.callback_query(F.data == "admin_stats")
 async def cb_admin_stats(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID: return
-    
     total_users = len(all_users)
     active_vip = sum(1 for uid in valid_keys if is_authorized(uid))
-    
-    current_month = datetime.now().strftime("%Y-%m")
-    monthly_revenue = 0
-    total_revenue = 0
-    
-    for uid, history in payment_history.items():
-        for record in history:
-            if record.get("description") == "Nạp tiền tự động":
-                try:
-                    amount_str = record.get("details", "0").replace("+", "").replace("đ", "").replace(",", "")
-                    amount = float(amount_str)
-                    total_revenue += amount
-                    
-                    record_date = datetime.fromisoformat(record.get("date", ""))
-                    if record_date.strftime("%Y-%m") == current_month:
-                        monthly_revenue += amount
-                except Exception:
-                    pass
-                    
+    total_balance = sum(user_balances.values())
     text = (
         "📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n"
         f"👥 Tổng số người dùng: <b>{total_users}</b>\n"
         f"👑 Người dùng VIP (Active): <b>{active_vip}</b>\n"
         f"🔑 Tổng số Key đã tạo: <b>{len(key_store)}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Doanh thu tháng này: <b>{monthly_revenue:,.0f}đ</b>\n"
-        f"🏦 Tổng doanh thu (All-time): <b>{total_revenue:,.0f}đ</b>"
+        f"💰 Tổng số dư trong hệ thống: <b>{total_balance:,.0f}đ</b>"
     )
     await cb.message.edit_text(text, reply_markup=kb_admin_menu())
     await cb.answer("Đã cập nhật thống kê!")
@@ -1128,55 +813,28 @@ async def cb_admin_stats(cb: CallbackQuery):
 @dp.callback_query(F.data == "admin_listkeys")
 async def cb_admin_listkeys(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID: return
-    
     if not key_store:
         await cb.answer("Chưa có key nào.", show_alert=True)
         return
-
     lines = ["📋 <b>Danh sách Key</b>\n"]
     for k, v in key_store.items():
         used = f"User {v['used_by']}" if v["used_by"] else "Chưa dùng"
         d    = "♾️" if v["duration_days"] == -1 else f"{v['duration_days']}d"
         lines.append(f"• <code>{k}</code> [{d}] — {used}")
-    
     text = "\n".join(lines)
-    
     try:
         await cb.message.edit_text(text, reply_markup=kb_admin_menu())
         await cb.answer("Đã tải danh sách key!")
-    except Exception: # Message too long
+    except Exception:
         await cb.message.answer(text)
         await cb.answer("Danh sách key quá dài, đã gửi trong tin nhắn mới.")
-
-@dp.callback_query(F.data == "admin_pending_payments")
-async def cb_admin_pending_payments(cb: CallbackQuery):
-    if cb.from_user.id != ADMIN_ID: return
-    
-    if not pending_payments:
-        await cb.answer("Hiện không có hóa đơn nào đang chờ thanh toán.", show_alert=True)
-        return
-
-    lines = ["⏳ <b>DANH SÁCH HÓA ĐƠN ĐANG CHỜ</b>\n"]
-    for memo, info in pending_payments.items():
-        uid = info.get("uid", "N/A")
-        amount = info.get("amount", 0)
-        lines.append(f"• Mã: <code>{memo}</code> | UID: <code>{uid}</code> | Tiền: <b>{amount:,.0f}đ</b>")
-    
-    text = "\n".join(lines)
-    
-    try:
-        await cb.message.edit_text(text, reply_markup=kb_admin_menu())
-        await cb.answer("Đã tải danh sách hóa đơn chờ!")
-    except Exception: # Message too long
-        await cb.message.answer(text)
-        await cb.answer("Danh sách quá dài, đã gửi trong tin nhắn mới.")
 
 @dp.callback_query(F.data == "admin_clear_keys")
 async def cb_admin_clear_keys(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID: return
     await cb.message.edit_text(
         "⚠️ <b>BẠN CÓ CHẮC CHẮN MUỐN XÓA TOÀN BỘ KEY KHÔNG?</b>\n\n"
-        "Hành động này sẽ xóa tất cả key đã tạo và thu hồi VIP của tất cả người dùng. Không thể hoàn tác!",
+        "Hành động này sẽ xóa tất cả key và thu hồi VIP của tất cả người dùng. Không thể hoàn tác!",
         reply_markup=kb_admin_confirm_clear()
     )
     await cb.answer()
@@ -1187,10 +845,7 @@ async def cb_admin_confirm_clear_yes(cb: CallbackQuery):
     key_store.clear()
     valid_keys.clear()
     save_data()
-    await cb.message.edit_text(
-        "✅ <b>Đã xóa toàn bộ Key trong hệ thống!</b>",
-        reply_markup=kb_admin_menu()
-    )
+    await cb.message.edit_text("✅ <b>Đã xóa toàn bộ Key trong hệ thống!</b>", reply_markup=kb_admin_menu())
     await cb.answer("Đã dọn dẹp toàn bộ key!", show_alert=True)
 
 @dp.callback_query(F.data == "admin_confirm_clear_no")
@@ -1206,10 +861,7 @@ async def cb_admin_confirm_clear_no(cb: CallbackQuery):
 async def cb_admin_addkey_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.addkey_key)
-    await cb.message.edit_text(
-        "<b>Bước 1/2:</b> Vui lòng nhập tên Key bạn muốn tạo:",
-        reply_markup=kb_cancel_admin()
-    )
+    await cb.message.edit_text("<b>Bước 1/2:</b> Nhập tên Key muốn tạo:", reply_markup=kb_cancel_admin())
     await cb.answer()
 
 @dp.message(AdminState.addkey_key)
@@ -1217,11 +869,11 @@ async def process_admin_addkey_key(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_ID: return
     key = msg.text.strip()
     if key in key_store:
-        await msg.answer(f"⚠️ Key <code>{key}</code> đã tồn tại! Vui lòng nhập một key khác:", reply_markup=kb_cancel_admin())
+        await msg.answer(f"⚠️ Key <code>{key}</code> đã tồn tại! Nhập key khác:", reply_markup=kb_cancel_admin())
         return
     await state.update_data(key=key)
     await state.set_state(AdminState.addkey_days)
-    await msg.answer("<b>Bước 2/2:</b> Vui lòng nhập số ngày sử dụng cho key (nhập -1 cho key vĩnh viễn):", reply_markup=kb_cancel_admin())
+    await msg.answer("<b>Bước 2/2:</b> Nhập số ngày sử dụng (nhập -1 cho key vĩnh viễn):", reply_markup=kb_cancel_admin())
 
 @dp.message(AdminState.addkey_days)
 async def process_admin_addkey_days(msg: Message, state: FSMContext):
@@ -1229,7 +881,7 @@ async def process_admin_addkey_days(msg: Message, state: FSMContext):
     try:
         days = int(msg.text.strip())
     except ValueError:
-        await msg.answer("❗ Số ngày không hợp lệ. Vui lòng nhập một số nguyên (VD: 30 hoặc -1):", reply_markup=kb_cancel_admin())
+        await msg.answer("❗ Số ngày không hợp lệ. Nhập số nguyên (VD: 30 hoặc -1):", reply_markup=kb_cancel_admin())
         return
     data = await state.get_data()
     key = data['key']
@@ -1243,7 +895,7 @@ async def process_admin_addkey_days(msg: Message, state: FSMContext):
 async def cb_admin_genkeys_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.genkeys_amount)
-    await cb.message.edit_text("<b>Bước 1/2:</b> Vui lòng nhập số lượng key muốn tạo (tối đa 50):", reply_markup=kb_cancel_admin())
+    await cb.message.edit_text("<b>Bước 1/2:</b> Nhập số lượng key muốn tạo (tối đa 50):", reply_markup=kb_cancel_admin())
     await cb.answer()
 
 @dp.message(AdminState.genkeys_amount)
@@ -1253,11 +905,11 @@ async def process_admin_genkeys_amount(msg: Message, state: FSMContext):
         amount = int(msg.text.strip())
         if not (0 < amount <= 50): raise ValueError
     except ValueError:
-        await msg.answer("❗ Số lượng không hợp lệ. Vui lòng nhập một số từ 1 đến 50:", reply_markup=kb_cancel_admin())
+        await msg.answer("❗ Số lượng không hợp lệ (1-50):", reply_markup=kb_cancel_admin())
         return
     await state.update_data(amount=amount)
     await state.set_state(AdminState.genkeys_days)
-    await msg.answer("<b>Bước 2/2:</b> Vui lòng nhập số ngày sử dụng cho các key (nhập -1 cho key vĩnh viễn):", reply_markup=kb_cancel_admin())
+    await msg.answer("<b>Bước 2/2:</b> Nhập số ngày sử dụng (nhập -1 cho key vĩnh viễn):", reply_markup=kb_cancel_admin())
 
 @dp.message(AdminState.genkeys_days)
 async def process_admin_genkeys_days(msg: Message, state: FSMContext):
@@ -1265,7 +917,7 @@ async def process_admin_genkeys_days(msg: Message, state: FSMContext):
     try:
         days = int(msg.text.strip())
     except ValueError:
-        await msg.answer("❗ Số ngày không hợp lệ. Vui lòng nhập một số nguyên (VD: 30 hoặc -1):", reply_markup=kb_cancel_admin())
+        await msg.answer("❗ Số ngày không hợp lệ:", reply_markup=kb_cancel_admin())
         return
     data = await state.get_data()
     amount = data['amount']
@@ -1281,14 +933,14 @@ async def process_admin_genkeys_days(msg: Message, state: FSMContext):
     await state.clear()
     keys_text = "\n".join([f"<code>{k}</code>" for k in generated_keys])
     duration_text = f"{days} ngày" if days != -1 else "Vĩnh viễn ♾️"
-    await msg.answer(f"✅ <b>Đã tạo thành công {amount} key ({duration_text}):</b>\n\n{keys_text}\n\n<i>(Chạm vào key để copy)</i>")
+    await msg.answer(f"✅ <b>Đã tạo {amount} key ({duration_text}):</b>\n\n{keys_text}\n\n<i>(Chạm vào key để copy)</i>")
     await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
 
 @dp.callback_query(F.data == "admin_delkey")
 async def cb_admin_delkey_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.delkey_key)
-    await cb.message.edit_text("Vui lòng nhập tên Key bạn muốn xóa:", reply_markup=kb_cancel_admin())
+    await cb.message.edit_text("Nhập tên Key muốn xóa:", reply_markup=kb_cancel_admin())
     await cb.answer()
 
 @dp.message(AdminState.delkey_key)
@@ -1296,7 +948,7 @@ async def process_admin_delkey_key(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_ID: return
     key = msg.text.strip()
     if key not in key_store:
-        await msg.answer(f"⚠️ Key <code>{key}</code> không tồn tại! Vui lòng nhập lại:", reply_markup=kb_cancel_admin())
+        await msg.answer(f"⚠️ Key <code>{key}</code> không tồn tại! Nhập lại:", reply_markup=kb_cancel_admin())
         return
     used_by = key_store[key].get("used_by")
     if used_by is not None and used_by in valid_keys:
@@ -1304,14 +956,14 @@ async def process_admin_delkey_key(msg: Message, state: FSMContext):
     del key_store[key]
     save_data()
     await state.clear()
-    await msg.answer(f"✅ Đã xóa Key: <code>{key}</code> thành công và thu hồi quyền (nếu có)!")
+    await msg.answer(f"✅ Đã xóa Key: <code>{key}</code> và thu hồi quyền (nếu có)!")
     await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
 
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.broadcast_text)
-    await cb.message.edit_text("Vui lòng nhập nội dung tin nhắn bạn muốn gửi tới tất cả người dùng VIP:", reply_markup=kb_cancel_admin())
+    await cb.message.edit_text("Nhập nội dung tin nhắn gửi tới tất cả người dùng VIP:", reply_markup=kb_cancel_admin())
     await cb.answer()
 
 @dp.message(AdminState.broadcast_text)
@@ -1331,124 +983,105 @@ async def process_admin_broadcast_text(msg: Message, state: FSMContext):
     await msg.answer(f"✅ Đã gửi thông báo tới {sent} người dùng VIP đang hoạt động.")
     await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
 
-@dp.callback_query(F.data == "admin_addmoney")
-async def cb_admin_addmoney_start(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_ID: return
-    await state.set_state(AdminState.addmoney_uid)
-    await cb.message.edit_text(
-        "<b>Bước 1/2:</b> Vui lòng nhập ID của người dùng bạn muốn cộng/trừ tiền:",
-        reply_markup=kb_cancel_admin()
-    )
-    await cb.answer()
-
-@dp.message(AdminState.addmoney_uid)
-async def process_admin_addmoney_uid(msg: Message, state: FSMContext):
-    if msg.from_user.id != ADMIN_ID: return
-    try:
-        target_uid = int(msg.text.strip())
-    except ValueError:
-        await msg.answer("❗ ID người dùng không hợp lệ. Vui lòng nhập một dãy số (VD: 123456789):", reply_markup=kb_cancel_admin())
-        return
-    await state.update_data(target_uid=target_uid)
-    await state.set_state(AdminState.addmoney_amount)
-    await msg.answer("<b>Bước 2/2:</b> Vui lòng nhập số tiền muốn thay đổi:\n\n<i>(Nhập số dương để cộng, số âm để trừ. VD: 50000 hoặc -10000)</i>", reply_markup=kb_cancel_admin())
-
-@dp.message(AdminState.addmoney_amount)
-async def process_admin_addmoney_amount(msg: Message, state: FSMContext):
-    if msg.from_user.id != ADMIN_ID: return
-    try:
-        amount = int(msg.text.strip())
-    except ValueError:
-        await msg.answer("❗ Số tiền không hợp lệ. Vui lòng nhập một số nguyên (VD: 50000 hoặc -10000):", reply_markup=kb_cancel_admin())
-        return
-    
-    data = await state.get_data()
-    target_uid = data['target_uid']
-
-    current_balance = user_balances.get(target_uid, 0)
-    user_balances[target_uid] = current_balance + amount
-    
-    if target_uid not in payment_history:
-        payment_history[target_uid] = []
-    
-    action_desc = "Admin cộng tiền" if amount >= 0 else "Admin trừ tiền"
-    amount_str = f"+{amount:,.0f}đ" if amount >= 0 else f"{amount:,.0f}đ"
-
-    payment_history[target_uid].insert(0, {"date": datetime.now().isoformat(), "description": action_desc, "details": amount_str})
-    save_data()
-    await state.clear()
-
-    new_balance = user_balances[target_uid]
-    await msg.answer(f"✅ Đã thay đổi số dư thành công!\n\n👤 User ID: <code>{target_uid}</code>\n💰 Số dư mới: <b>{new_balance:,.0f}đ</b>")
-    await msg.answer("🛠 <b>MENU QUẢN TRỊ (ADMIN)</b> 🛠", reply_markup=kb_admin_menu())
-
-    try:
-        await bot.send_message(target_uid, f"ℹ️ <b>THÔNG BÁO THAY ĐỔI SỐ DƯ</b>\n\nSố dư của bạn đã được Admin thay đổi một lượng là <b>{amount_str}</b>.\n💰 Số dư hiện tại: <b>{new_balance:,.0f}đ</b>")
-    except Exception as e:
-        log.warning(f"Không thể gửi tin nhắn cho user {target_uid}: {e}")
 
 # ─────────────────────────────────────────────
-#  WEBHOOK: AUTO DUYỆT THANH TOÁN SEPAY
+#  WEBHOOK SEPAY — ✅ ĐÃ FIX HOÀN TOÀN
+#  - Tìm "NAP <uid>" trong nội dung CK
+#  - Không cần pending_payments
+#  - Không mất dữ liệu khi Render restart
+#  - Log đầy đủ để debug
 # ─────────────────────────────────────────────
 @app.post("/sepay-webhook")
 async def sepay_webhook(request: Request):
     try:
+        raw_body = await request.body()
+        log.info(f"📥 WEBHOOK RAW: {raw_body.decode('utf-8', errors='ignore')}")
+
         data = await request.json()
         amount_in = float(data.get('transferAmount', 0))
         content = str(data.get('content', '')).upper()
-        
-        log.info(f"💰 SePay Webhook: +{amount_in}đ | Nội dung: {content}")
 
-        memos_to_remove = []
-        for memo, info in pending_payments.items():
-            # Nếu Nội dung và Số tiền khớp với hóa đơn đang chờ
-            if memo in content and amount_in >= info["amount"]:
-                uid = info["uid"]
-                
-                # Cộng tiền vào số dư
-                if uid not in user_balances:
-                    user_balances[uid] = 0
-                user_balances[uid] += amount_in
+        log.info(f"💰 SePay: +{amount_in}đ | Nội dung: {content}")
 
-                # Thêm vào lịch sử giao dịch
-                if uid not in payment_history:
-                    payment_history[uid] = []
-                payment_history[uid].insert(0, {
-                    "date": datetime.now().isoformat(),
-                    "description": f"Nạp tiền tự động",
-                    "details": f"+{amount_in:,.0f}đ"
-                })
-                save_data()
-                
-                # Báo cho User
-                await bot.send_message(uid, f"✅ <b>NẠP TIỀN THÀNH CÔNG!</b>\n\nHệ thống đã nhận được <b>{amount_in:,.0f}đ</b> và cộng vào số dư của bạn.\n💰 Số dư hiện tại: <b>{user_balances[uid]:,.0f}đ</b>\n\n<i>👉 Vui lòng vào mục Menu Chính -> <b>MUA VIP</b> để đổi số dư lấy ngày sử dụng!</i>")
-                # Báo cho Admin
-                await bot.send_message(ADMIN_ID, f"💰 <b>KHÁCH NẠP TIỀN (WEBHOOK)</b>\n\n👤 UID: <code>{uid}</code>\n💵 Số tiền: +{amount_in:,.0f}đ\n📝 Nội dung: {content}")
-                
-                # Xóa mã QR cũ
-                chat_id = info.get("chat_id")
-                msg_id = info.get("message_id")
-                if chat_id and msg_id:
-                    try:
-                        await bot.delete_message(chat_id, msg_id)
-                    except Exception as e:
-                        log.warning(f"Không thể xóa mã QR cũ: {e}")
+        # Tìm "NAP <UID>" trong nội dung chuyển khoản
+        match = re.search(r'NAP\s*(\d+)', content)
+        if not match:
+            log.info(f"❌ Không tìm thấy mã NAP. Content: {content}")
+            return {"status": "ignored", "reason": "no NAP code"}
 
-                memos_to_remove.append(memo)
-                
-        # Xóa các bill đã duyệt khỏi hàng chờ
-        for m in memos_to_remove:
-            del pending_payments[m]
-            save_data()
-            
+        uid = int(match.group(1))
+        log.info(f"✅ Tìm thấy UID: {uid}, Số tiền: {amount_in}")
+
+        # Cộng tiền vào số dư
+        if uid not in user_balances:
+            user_balances[uid] = 0
+        user_balances[uid] += int(amount_in)
+
+        # Lưu lịch sử giao dịch
+        if uid not in payment_history:
+            payment_history[uid] = []
+        payment_history[uid].insert(0, {
+            "date": now_vn().isoformat(),
+            "description": "Nạp tiền tự động (SePay)",
+            "details": f"+{amount_in:,.0f}đ"
+        })
+        save_data()
+
+        bal = user_balances[uid]
+
+        # Gửi thông báo cho User
+        try:
+            await bot.send_message(
+                uid,
+                f"✅ <b>NẠP TIỀN THÀNH CÔNG!</b>\n\n"
+                f"💰 Đã nhận: <b>+{amount_in:,.0f}đ</b>\n"
+                f"💳 Số dư hiện tại: <b>{bal:,.0f}đ</b>\n\n"
+                f"<i>👉 Vào Menu Chính → <b>MUA VIP</b> để đổi số dư thành ngày sử dụng!</i>"
+            )
+            log.info(f"✅ Đã gửi thông báo cho user {uid}")
+        except Exception as e:
+            log.warning(f"⚠️ Không gửi được tin nhắn cho user {uid}: {e}")
+
+        # Lấy thông tin Telegram của user
+        tele_name = "Không rõ"
+        tele_username = ""
+        try:
+            chat = await bot.get_chat(uid)
+            tele_name = chat.full_name or "Không rõ"
+            tele_username = f"@{chat.username}" if chat.username else "Không có username"
+        except Exception:
+            pass
+
+        now_str = now_vn().strftime('%d/%m/%Y %H:%M:%S')
+
+        # Gửi thông báo cho Admin
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔔 <b>ĐƠN NẠP TIỀN MỚI</b>\n"
+                f"{'━'*28}\n"
+                f"👤 <b>Tên Telegram:</b> {tele_name}\n"
+                f"🔗 <b>Username:</b> {tele_username}\n"
+                f"🆔 <b>ID Telegram:</b> <code>{uid}</code>\n"
+                f"{'━'*28}\n"
+                f"⏰ <b>Thời gian:</b> {now_str}\n"
+                f"📝 <b>Nội dung CK:</b> <code>{content}</code>\n"
+                f"💵 <b>Số tiền:</b> <b>+{amount_in:,.0f}đ</b>\n"
+                f"{'━'*28}\n"
+                f"💳 <b>Số dư mới của khách:</b> {bal:,.0f}đ"
+            )
+        except Exception as e:
+            log.warning(f"⚠️ Không gửi được tin nhắn cho admin: {e}")
+
         return {"status": "success"}
-    except Exception as e:
-        log.error(f"Webhook error: {e}")
-        return {"status": "error"}
 
+    except Exception as e:
+        log.error(f"❌ Webhook error: {e}")
+        return {"status": "error", "detail": str(e)}
+
+# Route alias
 @app.post("/api/sepay-webhook")
 async def sepay_webhook_api(request: Request):
-    """Alias route - cùng xử lý như /sepay-webhook"""
     return await sepay_webhook(request)
 
 @app.get("/")
@@ -1456,124 +1089,19 @@ async def health_check():
     return {"status": "alive"}
 
 # ─────────────────────────────────────────────
-#  TIẾN TRÌNH DỌN DẸP HÓA ĐƠN & TIN NHẮN CŨ
-# ─────────────────────────────────────────────
-async def auto_update_predictions():
-    while True:
-        await asyncio.sleep(3)  # Kiểm tra API liên tục mỗi 3 giây
-        if not tracked_live_messages:
-            continue
-            
-        # Gom nhóm theo game_id để giảm thiểu số lần gọi API
-        games_to_check = set(tracked_live_messages.values())
-        
-        for game_id in games_to_check:
-            try:
-                data = await asyncio.to_thread(fetch_prediction, game_id)
-                current_session = str(data.get("current_session"))
-                
-                # Nếu có phiên mới khác với phiên cũ đã lưu
-                if current_session and current_session != last_game_sessions.get(game_id):
-                    last_game_sessions[game_id] = current_session
-                    if game_id.startswith("bcr_"):
-                        table = game_id.split("_")[1]
-                        game = {"id": game_id, "name": f"👠 Baccarat Sexy (Bàn {table})", "type": "baccarat"}
-                    else:
-                        game = GAME_MAP.get(game_id)
-                    text = format_result(game, data)
-                    
-                    # Cập nhật tất cả các tin nhắn đang xem game này
-                    dead_msgs = []
-                    for (chat_id, msg_id), g_id in tracked_live_messages.items():
-                        if g_id == game_id:
-                            try:
-                                await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id)
-                            except Exception:
-                                dead_msgs.append((chat_id, msg_id))
-                                
-                    # Xóa các tin nhắn không thể edit (do đã bị block/xóa) khỏi bộ nhớ
-                    for dm in dead_msgs:
-                        tracked_live_messages.pop(dm, None)
-            except Exception as e:
-                log.warning(f"Lỗi auto update game {game_id}: {e}")
-
-async def cleanup_old_messages():
-    while True:
-        await asyncio.sleep(600)  # Cứ 10 phút kiểm tra 1 lần
-        now = datetime.now()
-        to_remove = []
-        for msg_info in tracked_messages:
-            try:
-                dt = datetime.fromisoformat(msg_info["timestamp"])
-                if now - dt > timedelta(hours=3):
-                    to_remove.append(msg_info)
-            except ValueError:
-                to_remove.append(msg_info)
-        
-        if to_remove:
-            for m in to_remove:
-                try:
-                    await bot.delete_message(m["chat_id"], m["message_id"])
-                except Exception:
-                    pass
-                if m in tracked_messages:
-                    tracked_messages.remove(m)
-            save_data()
-
-async def cleanup_pending_payments():
-    while True:
-        await asyncio.sleep(600)  # Cứ 10 phút kiểm tra 1 lần
-        now = datetime.now()
-        expired_memos = []
-        for memo, info in pending_payments.items():
-            created_at_str = info.get("created_at")
-            if created_at_str:
-                try:
-                    created_at = datetime.fromisoformat(created_at_str)
-                    if now - created_at > timedelta(hours=1):
-                        expired_memos.append(memo)
-                except ValueError:
-                    pass
-            else:
-                # Hóa đơn cũ (trước khi update code) không có giờ -> dọn luôn
-                expired_memos.append(memo)
-                
-        if expired_memos:
-            for memo in expired_memos:
-                info = pending_payments.get(memo, {})
-                chat_id = info.get("chat_id")
-                msg_id = info.get("message_id")
-                if chat_id and msg_id:
-                    try:
-                        await bot.delete_message(chat_id, msg_id)
-                    except Exception:
-                        pass
-                del pending_payments[memo]
-            save_data()
-            log.info(f"Đã tự động dọn dẹp {len(expired_memos)} hóa đơn chờ quá hạn.")
-
-# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 async def main():
-    log.info("Bot đang khởi động...")
+    log.info("🚀 Bot đang khởi động...")
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
     server = uvicorn.Server(config)
-    
-    # Khởi động tiến trình dọn dẹp ngầm
-    asyncio.create_task(cleanup_pending_payments())
-    asyncio.create_task(cleanup_old_messages())
-    asyncio.create_task(auto_update_predictions())
-    asyncio.create_task(check_expiring_keys())
-
     try:
         await asyncio.gather(
             server.serve(),
-            # Thêm handle_signals=False để tránh xung đột hệ thống
             dp.start_polling(bot, handle_signals=False)
         )
     except OSError as e:
-        log.error(f"Lỗi Port: Cổng 8000 đang bị kẹt hoặc được dùng bởi app khác. Hãy tắt các terminal cũ và chạy lại! Chi tiết: {e}")
+        log.error(f"Lỗi Port: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
